@@ -1,7 +1,8 @@
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QToolBar, QMenuBar, QDialog, QLineEdit, QFormLayout, QVBoxLayout, QHBoxLayout, QPushButton,
-                                QMessageBox, QStatusBar, QCheckBox, QGroupBox, QLabel, QFileDialog)
-from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings
+                                QMessageBox, QStatusBar, QCheckBox, QGroupBox, QLabel, QFileDialog, QComboBox, QWidget, QSizePolicy, QSplitter,
+                                QDockWidget, QTextEdit)
+from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray
 from PySide6.QtGui import QIcon, QAction, QIntValidator, QRegularExpressionValidator
 
 import sys
@@ -15,11 +16,15 @@ asset_path = str(Path(__file__).parent / "assets")
 class MainWindow(QMainWindow):
     def __init__(self, app: QApplication):
         super().__init__()
-        self.resize(800, 600)
+        self.setWindowTitle("TraffIQ-PH Control Panel")
+        self.resize(1500, 900)
         self.app = app
 
         # Qsettings
         self.settings = QSettings("Lanaia Robotics", "TraffIQ-PH")
+
+        # Hint docks and load layout
+        self.load_layout()
 
         # Menu bar
         menu_bar = MenuBar(self)
@@ -41,8 +46,62 @@ class MainWindow(QMainWindow):
         self.experimental_settings = {}
         self.load_all_settings()
 
-        # TODO: Propagate changes in the settings to the current system
+        # TODO: Propagate changes in the settings to the current layout
+        # TODO: Adjust save and load to include the geometries and states
     
+    def load_layout(self):
+        """ Load layout. """
+        camera_widget = CameraWidget()
+        metrics_widget = MetricsWidget()
+        logs_widget = LogsWidget()
+        chart_left_widget = ChartWidget("Live Chart A")
+        chart_right_widget = ChartWidget("Live Chart B")
+
+        # Dock the components
+        self.dock_cameras = self._add_dock("Cameras", camera_widget, Qt.LeftDockWidgetArea)
+        self.dock_metrics = self._add_dock("System Metrics", metrics_widget, Qt.RightDockWidgetArea)
+        self.dock_logs = self._add_dock("Logs", logs_widget, Qt.RightDockWidgetArea)
+        self.splitDockWidget(self.dock_metrics, self.dock_logs, Qt.Vertical)
+        self.dock_chart_left = self._add_dock("Live Chart A", chart_left_widget, Qt.BottomDockWidgetArea)
+        self.dock_chart_right = self._add_dock("Live Chart B", chart_right_widget, Qt.BottomDockWidgetArea)
+        self.splitDockWidget(self.dock_chart_left, self.dock_chart_right, Qt.Horizontal)
+        self.resizeDocks([self.dock_cameras, self.dock_chart_left], [700, 200], Qt.Vertical)
+    
+    def set_layout(self, reset=False):
+        """Restore the window layout to its standard configuration."""
+
+        try:
+            if reset:
+                # Load standard layout if reset
+                standard_path = f"{asset_path}/standard_layout.json"
+                with open(standard_path, "r") as f:
+                    data = json.load(f)
+            else:
+                # Set the layout using current layout settings
+                
+                data = self.layout_settings
+            
+            if not data:
+                print("No layout settings can be found.")
+                return
+
+            # Restore top-level window geometry and dock state
+            self.restoreGeometry(QByteArray.fromHex(data["geometry"].encode()))
+            self.restoreState(QByteArray.fromHex(data["state"].encode()))
+
+            # Restore internal camera splitter layout
+            if "camera" in data and hasattr(self, "dock_cameras"):
+                self.dock_cameras.widget().restore_camera_layout(data["camera"])
+
+            self.statusBar().showMessage("Layout reset to standard configuration.", 3000)
+
+        except FileNotFoundError:
+            self.statusBar().showMessage("Standard layout file not found.", 5000)
+
+        except Exception as e:
+            print(f"Error loading standard layout: {e}")
+            self.statusBar().showMessage("Error resetting layout.", 5000)
+
     def load_all_settings(self):
         """ Load cameras and UI settings from system store. """
 
@@ -81,6 +140,9 @@ class MainWindow(QMainWindow):
                     "location": False,
                     "traffic_phase": True,
                     "estimated_congestion": True,
+                },
+                "logs": {
+                    "log_level": "Info",
                 }
             }
         
@@ -93,9 +155,25 @@ class MainWindow(QMainWindow):
                 self.experimental_settings = {}
         else:
             self.experimental_settings = {}
+        
+        # Load layout settings
+        raw_layout = self.settings.value("layout")
+        if raw_layout:
+            try:
+                self.layout_settings = json.loads(raw_layout)
+                print("Hello:", type(self.layout_settings))
+                self.set_layout()
+                self.statusBar().showMessage("Successfully loaded settings from last session.")
+            except Exception:
+                self.statusBar().showMessage("Unsuccessfully loaded settings from last session.")
+                self.layout_settings = {}
+        else:
+            self.layout_settings = {}
 
     def save_all_settings(self):
         """ Save all settings to system. """
+
+        self._save_current_layout()
         
         # Save cameras
         data = [cam.__dict__.copy() for cam in self.cameras]
@@ -108,6 +186,9 @@ class MainWindow(QMainWindow):
         
         # Save experimental settings
         self.settings.setValue("experimental_settings", json.dumps(self.experimental_settings))
+
+        # Save geometry and state
+        self.settings.setValue("layout", json.dumps(self.layout_settings))
 
     def _load_configs(self):
         """Import settings from a JSON file."""
@@ -126,22 +207,32 @@ class MainWindow(QMainWindow):
         # restore other settings
         self.display_settings = payload.get("display_settings", {})
         self.experimental_settings = payload.get("experimental_settings", {})
+        
+        # restore layout settings
+        self.layout_settings = payload.get("layout", {})
+
+        print("Hello:", type(self.layout_settings))
 
         # also update QSettings so it’s consistent
         self.save_all_settings()
+
+        # set layout
+        self.set_layout()
 
         self.statusBar().showMessage(f"Successfully loaded settings from {path}.")
 
     def _save_as_configs(self):
         """Export settings to a JSON file."""
+        
         path, _ = QFileDialog.getSaveFileName(self, "Save Configs", "", "JSON Files (*.json)")
-        if not path:
-            return
+
+        self._save_current_layout()
         
         payload = {
             "cameras": [cam.__dict__.copy() for cam in self.cameras],
             "display_settings": self.display_settings,
             "experimental_settings": self.experimental_settings,
+            "layout": self.layout_settings,
         }
         for d in payload["cameras"]:
             d.pop("full_link", None)
@@ -151,8 +242,47 @@ class MainWindow(QMainWindow):
         
         self.statusBar().showMessage(f"Successfully saved settings to {path}.")
 
+        # TODO: BUG: Saved settings.json doesn't restore the layout settings.
+
+    def _save_current_layout(self):
+        self._default_geometry = self.saveGeometry()
+        self._default_state = self.saveState()
+        self._default_camera_state = self.dock_cameras.widget().save_camera_layout()
+
+        self.layout_settings = {
+            "geometry": self._default_geometry.toHex().data().decode(), 
+            "state": self._default_state.toHex().data().decode(),
+            "camera": self._default_camera_state
+        }
+
     def _quit(self):
         self.app.quit()
+
+    def _add_dock(self, title: str, widget, area):
+        dock = QDockWidget(title, self)
+        dock.setObjectName(title.replace(" ", "_").lower())
+        dock.setWidget(widget)
+        dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea |
+            Qt.RightDockWidgetArea |
+            Qt.TopDockWidgetArea |
+            Qt.BottomDockWidgetArea
+        )
+        dock.setFeatures(
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable |
+            QDockWidget.DockWidgetClosable
+        )
+        
+        self.addDockWidget(area, dock)
+        return dock
+    # Overriden
+
+    def resizeEvent(self, event):
+        """Force charts to stay smaller relative to cameras after resize/maximize."""
+        super().resizeEvent(event)
+        self.resizeDocks([self.dock_cameras, self.dock_chart_left], [700, 200], Qt.Vertical)
+
 
 class MenuBar(QMenuBar):
     def __init__(self, parent: MainWindow=None):
@@ -160,13 +290,14 @@ class MenuBar(QMenuBar):
 
         # Add menus
         self.addFileMenu()
+        self.addViewMenu()
         self.addHelpMenu()
 
     def addFileMenu(self):
         self.file_menu = self.addMenu("File")
-        load_action = self.file_menu.addAction("Load")
-        save_action = self.file_menu.addAction("Save")
-        save_as_action = self.file_menu.addAction("Save as")
+        load_action = self.file_menu.addAction("Load settings")
+        save_action = self.file_menu.addAction("Save settings")
+        save_as_action = self.file_menu.addAction("Save settings as")
         quit_action = self.file_menu.addAction("Quit")
 
         load_action.setToolTip("Load settings and configurations.")
@@ -183,6 +314,21 @@ class MenuBar(QMenuBar):
         save_as_action.triggered.connect(self.parent()._save_as_configs)
         quit_action.triggered.connect(self.parent()._quit)
     
+    def addViewMenu(self):
+        self.view_menu = self.addMenu("View")
+
+        for dock in [self.parent().dock_cameras,
+                     self.parent().dock_metrics,
+                     self.parent().dock_logs,
+                     self.parent().dock_chart_left,
+                     self.parent().dock_chart_right]:
+            action = dock.toggleViewAction()
+            self.view_menu.addAction(action)
+        
+        self.view_menu.addSeparator()
+        reset_action = self.view_menu.addAction("Reset layout")
+        reset_action.triggered.connect(lambda: self.parent().set_layout(reset=True))
+
     def addHelpMenu(self):
         self.help_menu = self.addMenu("Help")
         
@@ -192,6 +338,7 @@ class MainToolBar(QToolBar):
         self.setOrientation(Qt.Orientation.Vertical)
         self.setIconSize(QSize(30, 30))
         self.setWindowTitle("Main Toolbar")
+        self.setObjectName("main_toolbar")
 
         # Add actions
         self.actionAddSource()
@@ -394,6 +541,18 @@ class ChangeDisplaySettingsDialog(QDialog):
         osd_group.setLayout(osd_layout)
         main_layout.addWidget(osd_group)
 
+        # --- Group 3: Logs
+        log_group = QGroupBox("Logs")
+        log_layout = QVBoxLayout()
+        log_layout.addWidget(QLabel("Configure logs settings:"))
+        self.cb_log_level = QComboBox()
+        self.cb_log_level.addItems(["Debug", "Info" ,"Errors"])
+
+        log_layout.addWidget(self.cb_log_level)
+
+        log_group.setLayout(log_layout)
+        main_layout.addWidget(log_group)
+
         # --- Buttons ---
         button_layout = QHBoxLayout()
         self.ok_button = QPushButton("OK")
@@ -423,12 +582,16 @@ class ChangeDisplaySettingsDialog(QDialog):
                 "location": self.cb_location.isChecked(),
                 "traffic_phase": self.cb_phase.isChecked(),
                 "estimated_congestion": self.cb_congestion.isChecked(),
+            },
+            "logs": {
+                "log_level": self.cb_log_level.currentText()
             }
         }
     
     def set_settings(self, settings: dict):
         bb = settings.get("bounding_boxes", {})
         osd = settings.get("osd", {})
+        logs = settings.get("logs", {})
 
         self.cb_obstructions.setChecked(bb.get("obstructions", False))
         self.cb_two_wheeled.setChecked(bb.get("two_wheeled", False))
@@ -440,11 +603,93 @@ class ChangeDisplaySettingsDialog(QDialog):
         self.cb_location.setChecked(osd.get("location", False))
         self.cb_phase.setChecked(osd.get("traffic_phase", False))
         self.cb_congestion.setChecked(osd.get("estimated_congestion", False))
-
-
+        log_level = logs.get("log_level", "Info")   # default to "Info"
+        idx = self.cb_log_level.findText(log_level)
+        if idx >= 0:
+            self.cb_log_level.setCurrentIndex(idx)
 
 class EditRegionDialog(QDialog):
     pass
 
 class ChangeExperimentalSettingsDialog(QDialog):
     pass
+
+class CameraWidget(QSplitter):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        cam1 = self.make_camera_widget("Camera 1")
+        cam2 = self.make_camera_widget("Camera 2")
+        cam3 = self.make_camera_widget("Camera 3")
+        cam4 = self.make_camera_widget("Camera 4")
+
+        # top row (cam1 | cam2)
+        self.top_split = QSplitter(Qt.Horizontal)
+        self.top_split.addWidget(cam1)
+        self.top_split.addWidget(cam2)
+
+        # bottom row (cam3 | cam4)
+        self.bottom_split = QSplitter(Qt.Horizontal)
+        self.bottom_split.addWidget(cam3)
+        self.bottom_split.addWidget(cam4)
+
+        # vertical split (top row over bottom row)
+        self.setOrientation(Qt.Vertical)
+        self.addWidget(self.top_split)
+        self.addWidget(self.bottom_split)
+    
+    def make_camera_widget(self, text):
+        lbl = QLabel(text)
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet("background: #4477aa; color: white; border: 1px solid black;")
+        lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        return lbl
+
+    def save_camera_layout(self):
+        """Return all splitter states as dict."""
+        return {
+            "main": bytes(self.saveState()).hex(),
+            "top": bytes(self.top_split.saveState()).hex(),
+            "bottom": bytes(self.bottom_split.saveState()).hex(),
+        }
+
+    def restore_camera_layout(self, data: dict):
+        """Restore all splitter geometries."""
+        if not data:
+            return
+        if "main" in data:
+            self.restoreState(bytes.fromhex(data["main"]))
+        if "top" in data:
+            self.top_split.restoreState(bytes.fromhex(data["top"]))
+        if "bottom" in data:
+            self.bottom_split.restoreState(bytes.fromhex(data["bottom"]))
+
+class MetricsWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        metrics_layout = QVBoxLayout()
+        for text in ["CPU: ...", "RAM: ...", "GPU: ...", "Uptime: ...", "Latency: ...", "Avg FPS: ..."]:
+            lbl = QLabel(text)
+            metrics_layout.addWidget(lbl)
+        self.setLayout(metrics_layout)
+        self.setFixedSize(200, 150)
+
+class LogsWidget(QTextEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+class ChartWidget(QLabel):
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+
+        self.make_chart_label(text)
+    
+    def make_chart_label(self, text):
+        self.setText(text)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("background: #55aa55; color: white; border: 1px solid black;")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.setMinimumHeight(100)
+        self.setMaximumHeight(300)

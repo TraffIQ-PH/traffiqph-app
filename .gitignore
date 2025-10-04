@@ -12,3 +12,4 @@ wheels/
 # Custom files
 src/
 settings/
+chatgpt.py
