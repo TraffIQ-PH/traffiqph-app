@@ -161,7 +161,6 @@ class MainWindow(QMainWindow):
         if raw_layout:
             try:
                 self.layout_settings = json.loads(raw_layout)
-                print("Hello:", type(self.layout_settings))
                 self.set_layout()
                 self.statusBar().showMessage("Successfully loaded settings from last session.")
             except Exception:
@@ -211,13 +210,11 @@ class MainWindow(QMainWindow):
         # restore layout settings
         self.layout_settings = payload.get("layout", {})
 
-        print("Hello:", type(self.layout_settings))
+        # set layout
+        self.set_layout()
 
         # also update QSettings so it’s consistent
         self.save_all_settings()
-
-        # set layout
-        self.set_layout()
 
         self.statusBar().showMessage(f"Successfully loaded settings from {path}.")
 
@@ -690,6 +687,6 @@ class ChartWidget(QLabel):
         self.setText(text)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("background: #55aa55; color: white; border: 1px solid black;")
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumHeight(100)
         self.setMaximumHeight(300)
