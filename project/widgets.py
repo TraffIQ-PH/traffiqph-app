@@ -4,16 +4,15 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QToolBar, QMenuBar, QD
                                 QDockWidget, QTextEdit, QProgressBar)
 from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray, QTimer
 from PySide6.QtGui import QIcon, QAction, QIntValidator, QRegularExpressionValidator
-import pyqtgraph as pg 
-import sys
+import pyqtgraph as pg
 import json
 from pathlib import Path
 import psutil
 import GPUtil
 import time
-from threading import Thread
+from threading import Thread, Event
 
-import inference as yolo_gst
+from inference import run_in_qt_mode
 from classes import Camera
 
 asset_path = str(Path(__file__).parent / "assets")
@@ -30,7 +29,7 @@ class MainWindow(QMainWindow):
 
         # Hint docks and load layout
         self.load_layout()
-        Thread(target=self.start_yolo, daemon=True).start()
+        
 
         # Menu bar
         menu_bar = MenuBar(self)
@@ -52,9 +51,29 @@ class MainWindow(QMainWindow):
         self.experimental_settings = {}
         self.logs = []
         self.load_all_settings()
-    
+
+        self.start_yolo()
+
     def start_yolo(self):
-        yolo_gst.run_in_qt_mode(self.cam_labels)  # new function
+    # Stop existing YOLO thread
+        if hasattr(self, "yolo_thread") and self.yolo_thread.is_alive():
+            self.yolo_stop_flag.set()
+            self.yolo_thread.join(timeout=2)
+            print("[INFO] Previous YOLO thread stopped.")
+
+        # Create a new stop flag for the new thread
+        self.yolo_stop_flag = Event()
+
+        # Start YOLO again
+        self.yolo_thread = Thread(
+            target=run_in_qt_mode,
+            args=(self.cam_labels, self.cameras, self.yolo_stop_flag),
+            daemon=True
+        )
+        self.yolo_thread.start()
+
+        self._log_message("YOLO restarted with updated camera list.", 3000)
+
 
     def load_layout(self):
         """ Load layout. """
@@ -191,10 +210,7 @@ class MainWindow(QMainWindow):
         self._save_current_layout()
         
         # Save cameras
-        data = [cam.__dict__.copy() for cam in self.cameras]
-        for d in data:
-            d.pop("full_link", None)
-        self.settings.setValue("cameras", json.dumps(data))
+        self.save_cameras()
 
         # Save display settings
         self.settings.setValue("display_settings", json.dumps(self.display_settings))
@@ -206,6 +222,12 @@ class MainWindow(QMainWindow):
         self.settings.setValue("layout", json.dumps(self.layout_settings))
 
         self._log_message("All settings have been saved in your computer.", 3000)
+
+    def save_cameras(self):
+        data = [cam.__dict__.copy() for cam in self.cameras]
+        for d in data:
+            d.pop("full_link", None)
+        self.settings.setValue("cameras", json.dumps(data))
 
     def _load_configs(self):
         """Import settings from a JSON file."""
@@ -415,6 +437,7 @@ class MainToolBar(QToolBar):
                 camera = Camera(**data)
                 self.parent().cameras.append(camera) # add current camera to cameras
                 self.parent().save_cameras() # save cameras persistently
+                self.parent().start_yolo()
                 self.parent()._log_message("Successfully added camera.", 3000)
                 print(f"Camera added: {camera}")
     
@@ -521,7 +544,7 @@ class AddSourceDialog(QDialog):
             "ip_address": self.address_edit.text().strip(),
             "username": self.username_edit.text().strip(),
             "password": self.password_edit.text().strip(),
-            "port": int(self.port_edit.text().strip()),
+            "rtsp_port": int(self.port_edit.text().strip()),
             "channel": int(self.channel_edit.text().strip()),
             "location": self.location_edit.text().strip(),
         }
@@ -553,7 +576,6 @@ class AddVideoSourceDialog(QDialog):
             print("File selected:", file_path)
 
         # TODO: continue loading video path
-
 
 class ChangeDisplaySettingsDialog(QDialog):
     def __init__(self, parent=None):

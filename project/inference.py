@@ -15,13 +15,11 @@ Gst.init(None)
 
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtCore import Qt
+import torch
+from ultralytics import YOLO
 
 
 # --- CONFIG ---
-PASSWORD = os.getenv("IPCAM_PASS", "changeme")  # export IPCAM_PASS='...'
-USER = "admin"
-IPS = ["192.168.1.64", "192.168.1.65", "192.168.1.66", "192.168.1.67"]
-RTSPS = [f'rtsp://{USER}:{PASSWORD}@{ip}:554/Streaming/Channels/102' for ip in IPS]  # substreams
 MODEL_PATH = str(Path(__file__).parent.parent / "yolo" / "yolo11x.pt")  # adjust to your model
 WINDOW = "YOLO 2x2 (low-latency)"
 TILE_W, TILE_H = 640, 360
@@ -140,134 +138,13 @@ def draw_boxes(frame, boxes, class_names):
         cv2.putText(frame, label, (x1 + 3, max(0, y1 - 4)), FONT, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
     return frame
 
-
-def main():
-    # Ultralytics YOLO
-    import torch
-    from ultralytics import YOLO
-
-    device = 0 if torch.cuda.is_available() else "cpu"
-    model = YOLO(MODEL_PATH)
-    model.to(device=device)
-    if device != "cpu":
-        model.fuse()
-        try:
-            model.model.half()
-        except Exception:
-            pass
-
-    # Init 4 cameras
-    cams: list[Cam] = []
-    for url in RTSPS:
-        cap = GstCam(build_pipeline(url, TILE_W, TILE_H))
-        cam = Cam(url=url, cap=cap, q=queue.Queue(maxsize=1))
-        t = threading.Thread(target=reader_thread, args=(cam,), daemon=True)
-        t.start()
-        cams.append(cam)
-
-    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW, TILE_W*2, TILE_H*2)
-
-    # FPS measurement (inference throughput = images / second)
-    inf_frames_accum = 0
-    inf_time_accum = 0.0
-    last_fps_print = time.perf_counter()
-    smoothed_fps = 0.0
-
-    try:
-        while True:
-            frames = []
-            for cam in cams:
-                try:
-                    cam.last = cam.q.get(timeout=0.02)
-                except queue.Empty:
-                    pass
-                frames.append(cam.last)
-
-            # batch inference on available frames
-            batch_imgs, idx_map = [], []
-            for i, f in enumerate(frames):
-                if f is not None:
-                    batch_imgs.append(f)
-                    idx_map.append(i)
-
-            results = []
-            batch_start = time.perf_counter()
-            if batch_imgs:
-                preds = model.predict(
-                    batch_imgs,
-                    imgsz=max(TILE_W, TILE_H),
-                    device=device,
-                    half=(device != "cpu"),
-                    conf=0.25,
-                    iou=0.45,
-                    verbose=False
-                )
-                results = preds
-            batch_elapsed = time.perf_counter() - batch_start
-
-            if batch_imgs:
-                inf_frames_accum += len(batch_imgs)
-                inf_time_accum += batch_elapsed
-                if inf_time_accum > 0:
-                    inst_fps = inf_frames_accum / inf_time_accum
-                    smoothed_fps = 0.8 * smoothed_fps + 0.2 * inst_fps if smoothed_fps > 0 else inst_fps
-
-            if results:
-                class_names = results[0].names
-                per_cam_counts = []
-                for r, i in zip(results, idx_map):
-                    counts = {}
-                    if r.boxes is not None and len(r.boxes) > 0:
-                        for cls_idx in r.boxes.cls.cpu().numpy().astype(int):
-                            name = class_names[int(cls_idx)]
-                            counts[name] = counts.get(name, 0) + 1
-
-                        xyxy = r.boxes.xyxy.cpu().numpy()
-                        conf = r.boxes.conf.unsqueeze(1).cpu().numpy()
-                        cls  = r.boxes.cls.unsqueeze(1).cpu().numpy()
-                        boxes = np.concatenate([xyxy, conf, cls], axis=1)
-                        frames[i] = draw_boxes(frames[i], boxes, class_names)
-
-                    per_cam_counts.append((i, counts))
-
-                now = time.perf_counter()
-                if now - last_fps_print > 1.0:
-                    last_fps_print = now
-                    lines = []
-                    for i, counts in per_cam_counts:
-                        ip = IPS[i] if i < len(IPS) else f"cam{i}"
-                        cls_str = ", ".join(f"{k}:{v}" for k, v in sorted(counts.items())) if counts else "none"
-                        lines.append(f"{ip} -> {cls_str}")
-                    if lines:
-                        fps_str = f" FPS:{smoothed_fps:.1f}" if smoothed_fps > 0 else ""
-                        print("[classes]" + fps_str, " | ".join(lines))
-
-            grid = make_grid(frames, TILE_W, TILE_H)
-            if smoothed_fps > 0:
-                txt = f"INF FPS: {smoothed_fps:.1f}"
-                cv2.putText(grid, txt, (10, 28), FONT, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
-
-            cv2.imshow(WINDOW, grid)
-            if cv2.waitKey(1) & 0xFF == 27:  # ESC
-                break
-
-    finally:
-        for cam in cams:
-            cam.alive = False
-            try:
-                cam.cap.release()
-            except Exception:
-                pass
-        cv2.destroyAllWindows()
-
-def run_in_qt_mode(label_widgets):
+def run_in_qt_mode(label_widgets, cameras, stop_flag):
     """
     Same as main(), but instead of cv2.imshow(),
     updates QLabel widgets in a PyQt application.
     """
-    import torch
-    from ultralytics import YOLO
+    if not cameras:
+        return
 
     device = 0 if torch.cuda.is_available() else "cpu"
     model = YOLO(MODEL_PATH)
@@ -280,9 +157,9 @@ def run_in_qt_mode(label_widgets):
             pass
 
     cams = []
-    for url in RTSPS:
-        cap = GstCam(build_pipeline(url, TILE_W, TILE_H))
-        cam = Cam(url=url, cap=cap, q=queue.Queue(maxsize=1))
+    for cam in cameras:
+        cap = GstCam(build_pipeline(cam.full_link, TILE_W, TILE_H))
+        cam = Cam(url=cam.full_link, cap=cap, q=queue.Queue(maxsize=1))
         t = threading.Thread(target=reader_thread, args=(cam,), daemon=True)
         t.start()
         cams.append(cam)
@@ -291,7 +168,7 @@ def run_in_qt_mode(label_widgets):
     last_fps_print = time.perf_counter()
 
     try:
-        while True:
+        while not stop_flag.is_set():
             frames = []
             for cam in cams:
                 try:
@@ -350,10 +227,3 @@ def run_in_qt_mode(label_widgets):
                 cam.cap.release()
             except Exception:
                 pass
-
-
-
-if __name__ == "__main__":
-    main()
-
-
