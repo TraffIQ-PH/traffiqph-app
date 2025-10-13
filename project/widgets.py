@@ -1,13 +1,17 @@
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QToolBar, QMenuBar, QDialog, QLineEdit, QFormLayout, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QMessageBox, QStatusBar, QCheckBox, QGroupBox, QLabel, QFileDialog, QComboBox, QWidget, QSizePolicy, QSplitter,
-                                QDockWidget, QTextEdit)
-from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray
+                                QDockWidget, QTextEdit, QProgressBar)
+from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray, QTimer
 from PySide6.QtGui import QIcon, QAction, QIntValidator, QRegularExpressionValidator
-
+import pyqtgraph as pg 
 import sys
 import json
 from pathlib import Path
+import psutil
+import GPUtil
+import time
+from threading import Thread
 
 from classes import Camera
 
@@ -44,26 +48,32 @@ class MainWindow(QMainWindow):
         # Load all settings and configurations
         self.display_settings = {}
         self.experimental_settings = {}
+        self.logs = []
         self.load_all_settings()
-
-        # TODO: Propagate changes in the settings to the current layout
-        # TODO: Adjust save and load to include the geometries and states
     
     def load_layout(self):
         """ Load layout. """
-        camera_widget = CameraWidget()
-        metrics_widget = MetricsWidget()
-        logs_widget = LogsWidget()
-        chart_left_widget = ChartWidget("Live Chart A")
-        chart_right_widget = ChartWidget("Live Chart B")
+        self.camera_widget = CameraWidget()
+        self.metrics_widget = MetricsWidget()
+        self.logs_widget = LogsWidget()
+        self.chart_left_widget = ChartWidget("Live Chart A")
+        self.chart_right_widget = MetricsChartWidget()
+
+        self.cam_labels = [
+            self.camera_widget.top_split.widget(0),
+            self.camera_widget.top_split.widget(1),
+            self.camera_widget.bottom_split.widget(0),
+            self.camera_widget.bottom_split.widget(1),
+        ]
+
 
         # Dock the components
-        self.dock_cameras = self._add_dock("Cameras", camera_widget, Qt.LeftDockWidgetArea)
-        self.dock_metrics = self._add_dock("System Metrics", metrics_widget, Qt.RightDockWidgetArea)
-        self.dock_logs = self._add_dock("Logs", logs_widget, Qt.RightDockWidgetArea)
+        self.dock_cameras = self._add_dock("Cameras", self.camera_widget, Qt.LeftDockWidgetArea)
+        self.dock_metrics = self._add_dock("System Metrics", self.metrics_widget, Qt.RightDockWidgetArea)
+        self.dock_logs = self._add_dock("Logs", self.logs_widget, Qt.RightDockWidgetArea)
         self.splitDockWidget(self.dock_metrics, self.dock_logs, Qt.Vertical)
-        self.dock_chart_left = self._add_dock("Live Chart A", chart_left_widget, Qt.BottomDockWidgetArea)
-        self.dock_chart_right = self._add_dock("Live Chart B", chart_right_widget, Qt.BottomDockWidgetArea)
+        self.dock_chart_left = self._add_dock("Live Chart A", self.chart_left_widget, Qt.BottomDockWidgetArea)
+        self.dock_chart_right = self._add_dock("Live Chart B", self.chart_right_widget, Qt.BottomDockWidgetArea)
         self.splitDockWidget(self.dock_chart_left, self.dock_chart_right, Qt.Horizontal)
         self.resizeDocks([self.dock_cameras, self.dock_chart_left], [700, 200], Qt.Vertical)
     
@@ -93,14 +103,14 @@ class MainWindow(QMainWindow):
             if "camera" in data and hasattr(self, "dock_cameras"):
                 self.dock_cameras.widget().restore_camera_layout(data["camera"])
 
-            self.statusBar().showMessage("Layout reset to standard configuration.", 3000)
+            self._log_message("Layout reset to standard configuration.", 3000)
 
         except FileNotFoundError:
-            self.statusBar().showMessage("Standard layout file not found.", 5000)
+            self._log_message("Standard layout file not found.", 5000)
 
         except Exception as e:
             print(f"Error loading standard layout: {e}")
-            self.statusBar().showMessage("Error resetting layout.", 5000)
+            self._log_message("Error resetting layout.", 5000)
 
     def load_all_settings(self):
         """ Load cameras and UI settings from system store. """
@@ -154,7 +164,10 @@ class MainWindow(QMainWindow):
             except Exception:
                 self.experimental_settings = {}
         else:
-            self.experimental_settings = {}
+            self.experimental_settings = {
+                "notify_officials": True,
+                "use_videos": False,
+            }
         
         # Load layout settings
         raw_layout = self.settings.value("layout")
@@ -162,9 +175,7 @@ class MainWindow(QMainWindow):
             try:
                 self.layout_settings = json.loads(raw_layout)
                 self.set_layout()
-                self.statusBar().showMessage("Successfully loaded settings from last session.")
             except Exception:
-                self.statusBar().showMessage("Unsuccessfully loaded settings from last session.")
                 self.layout_settings = {}
         else:
             self.layout_settings = {}
@@ -188,6 +199,8 @@ class MainWindow(QMainWindow):
 
         # Save geometry and state
         self.settings.setValue("layout", json.dumps(self.layout_settings))
+
+        self._log_message("All settings have been saved in your computer.", 3000)
 
     def _load_configs(self):
         """Import settings from a JSON file."""
@@ -216,7 +229,7 @@ class MainWindow(QMainWindow):
         # also update QSettings so it’s consistent
         self.save_all_settings()
 
-        self.statusBar().showMessage(f"Successfully loaded settings from {path}.")
+        self._log_message(f"Successfully loaded settings from {path}.")
 
     def _save_as_configs(self):
         """Export settings to a JSON file."""
@@ -237,9 +250,8 @@ class MainWindow(QMainWindow):
         with open(path, "w") as f:
             json.dump(payload, f, indent=4)
         
-        self.statusBar().showMessage(f"Successfully saved settings to {path}.")
+        self._log_message(f"Successfully saved settings to {path}.")
 
-        # TODO: BUG: Saved settings.json doesn't restore the layout settings.
 
     def _save_current_layout(self):
         self._default_geometry = self.saveGeometry()
@@ -273,6 +285,11 @@ class MainWindow(QMainWindow):
         
         self.addDockWidget(area, dock)
         return dock
+    
+    def _log_message(self, message: str, duration: int):
+        self.statusBar().showMessage(message, duration)
+        self.logs = [message] + self.logs
+        self.dock_logs.widget().setText("\n\n".join(self.logs))
     # Overriden
 
     def resizeEvent(self, event):
@@ -382,14 +399,19 @@ class MainToolBar(QToolBar):
     # Helper functions
 
     def _add_source(self):
-        dialog = AddSourceDialog(self)
-        if dialog.exec():
-            data = dialog.get_data()
-            camera = Camera(**data)
-            self.parent().cameras.append(camera) # add current camera to cameras
-            self.parent().save_cameras() # save cameras persistently
-            self.parent().statusBar().showMessage("Successfully added camera.", 3000)
-            print(f"Camera added: {camera}")
+        use_video = self.parent().experimental_settings.get("use_videos", False)
+        if use_video:
+            dialog = AddVideoSourceDialog(self)
+            dialog.exec()
+        else:
+            dialog = AddSourceDialog(self)
+            if dialog.exec():
+                data = dialog.get_data()
+                camera = Camera(**data)
+                self.parent().cameras.append(camera) # add current camera to cameras
+                self.parent().save_cameras() # save cameras persistently
+                self.parent()._log_message("Successfully added camera.", 3000)
+                print(f"Camera added: {camera}")
     
     def _change_display_settings(self):
         dialog = ChangeDisplaySettingsDialog(self.window())
@@ -399,7 +421,7 @@ class MainToolBar(QToolBar):
             settings = dialog.get_settings()
             self.parent().display_settings = settings
             self.parent().save_all_settings()
-            self.parent().statusBar().showMessage("Updated display settings", 3000)
+            self.parent()._log_message("Updated display settings", 3000)
             print("User settings:", settings)
         
     def _edit_region(self):
@@ -411,11 +433,18 @@ class MainToolBar(QToolBar):
             1. Notify officials for possible obstructions.
             2. Checkbox of shown bounding boxes. 
             3. Use other models?
-            4. Cap FPS
-
+            5. Use videos for demonstration.
         
         """
-        print("Change experimental settings!")
+        dialog = ChangeExperimentalSettingsDialog(self.window())
+        dialog.set_settings(self.parent().experimental_settings) # load defaults
+
+        if dialog.exec():
+            settings = dialog.get_settings()
+            self.parent().experimental_settings = settings
+            self.parent().save_all_settings()
+            self.parent()._log_message("Updated experimental settings", 3000)
+            print("User settings:", settings)
 
 class StatusBar(QStatusBar):
     def __init__(self, parent):
@@ -492,6 +521,35 @@ class AddSourceDialog(QDialog):
             "location": self.location_edit.text().strip(),
         }
 
+class AddVideoSourceDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Video Source")
+        self.setMinimumWidth(300)
+
+        layout = QVBoxLayout()
+        layout.setSpacing(20)
+        self.label = QLabel()
+        self.label.setText("The use videos settings is set to True, please select the video."
+                           "\nOtherwise, change the settings to False to link RTSP streams.")
+        self.btn = QPushButton("Select Video")
+        self.btn.clicked.connect(self.load_video)
+        
+        layout.addWidget(self.label)
+        layout.addWidget(self.btn)
+        
+
+        self.setLayout(layout)
+
+    def load_video(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select a Video File", "", "Video Files (*.mp4 *.avi *.mkv *.mov)")
+
+        if file_path:
+            print("File selected:", file_path)
+
+        # TODO: continue loading video path
+
+
 class ChangeDisplaySettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -552,7 +610,7 @@ class ChangeDisplaySettingsDialog(QDialog):
 
         # --- Buttons ---
         button_layout = QHBoxLayout()
-        self.ok_button = QPushButton("OK")
+        self.ok_button = QPushButton("Save")
         self.cancel_button = QPushButton("Cancel")
 
         self.ok_button.clicked.connect(self.accept)
@@ -609,7 +667,57 @@ class EditRegionDialog(QDialog):
     pass
 
 class ChangeExperimentalSettingsDialog(QDialog):
-    pass
+    """
+        1. Notify officials through email.
+        2. Use videos for demonstration.
+
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Change Experimental Settings")
+        self.setMinimumWidth(400)
+
+        main_layout = QVBoxLayout()
+
+        # Group
+        settings_group = QGroupBox("Experimental Settings")
+        settings_layout = QVBoxLayout()
+        settings_layout.addWidget(QLabel("Configure experimental settings:"))
+
+        self.cb_notify = QCheckBox("Notify officials for possible obstructions.")
+        self.cb_use_videos = QCheckBox("Use videos instead for demonstration purposes.")
+
+        settings_layout.addWidget(self.cb_notify)
+        settings_layout.addWidget(self.cb_use_videos)
+
+        settings_group.setLayout(settings_layout)
+        main_layout.addWidget(settings_group)
+
+        # --- Buttons ---
+        button_layout = QHBoxLayout()
+        self.ok_button = QPushButton("Save")
+        self.cancel_button = QPushButton("Cancel")
+
+        self.ok_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+
+        button_layout.addWidget(self.ok_button)
+        button_layout.addWidget(self.cancel_button)
+        main_layout.addLayout(button_layout)
+
+        self.setLayout(main_layout)
+
+    def get_settings(self):
+        """Return the chosen settings as a dict"""
+        return {
+            "notify_officials": self.cb_notify.isChecked(),
+            "use_videos": self.cb_use_videos.isChecked()
+        }
+    
+    def set_settings(self, settings: dict):
+        # back here
+        self.cb_notify.setChecked(settings.get("notify_officials", False))
+        self.cb_use_videos.setChecked(settings.get("use_videos", False))
 
 class CameraWidget(QSplitter):
     def __init__(self, parent=None):
@@ -662,20 +770,134 @@ class CameraWidget(QSplitter):
             self.bottom_split.restoreState(bytes.fromhex(data["bottom"]))
 
 class MetricsWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        metrics_layout = QVBoxLayout()
-        for text in ["CPU: ...", "RAM: ...", "GPU: ...", "Uptime: ...", "Latency: ...", "Avg FPS: ..."]:
-            lbl = QLabel(text)
-            metrics_layout.addWidget(lbl)
-        self.setLayout(metrics_layout)
-        self.setFixedSize(200, 150)
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("System Metrics")
+        self.setFixedSize(250, 160)
+
+        layout = QFormLayout()
+        layout.setVerticalSpacing(4)
+        layout.setHorizontalSpacing(10)
+
+        self.cpu_bar = QProgressBar()
+        self.cpu_bar.setRange(0, 100)
+        self.cpu_bar.setFormat("%p%")          # show percentage
+        self.cpu_bar.setAlignment(Qt.AlignCenter)
+        self.cpu_bar.setTextVisible(True)
+
+        self.ram_bar = QProgressBar()
+        self.ram_bar.setRange(0, 100)
+        self.ram_bar.setFormat("%p%")          # show percentage
+        self.ram_bar.setAlignment(Qt.AlignCenter)
+        self.ram_bar.setTextVisible(True)
+
+        self.gpu_bar = QProgressBar()
+        self.gpu_bar.setRange(0, 100)
+        self.gpu_bar.setFormat("%p%")          # show percentage
+        self.gpu_bar.setAlignment(Qt.AlignCenter)
+        self.gpu_bar.setTextVisible(True)
+
+        self.uptime_label = QLabel("-- s")
+
+        layout.addRow(QLabel("CPU:"), self.cpu_bar)
+        layout.addRow(QLabel("RAM:"), self.ram_bar)
+        layout.addRow(QLabel("GPU:"), self.gpu_bar)
+        layout.addRow(QLabel("Uptime:"), self.uptime_label)
+
+        self.setLayout(layout)
+
+        psutil.cpu_percent(interval=None)
+
+        self.start_time = time.time()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_metrics)
+        self.timer.start(1000)  # update every second
+
+    def update_metrics(self):
+        cpu = psutil.cpu_percent(interval=None)
+        self.cpu_bar.setValue(int(cpu))
+
+        ram = psutil.virtual_memory().percent
+        self.ram_bar.setValue(int(ram))
+
+        try:
+            gpus = GPUtil.getGPUs()
+            gpu_usage = gpus[0].load * 100 if gpus else 0
+        except Exception:
+            gpu_usage = 0
+        self.gpu_bar.setValue(int(gpu_usage))
+
+        uptime = int(time.time() - self.start_time)
+        self.uptime_label.setText(f"{uptime} s")
 
 class LogsWidget(QTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setReadOnly(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+class MetricsChartWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        layout = QVBoxLayout(self)
+        self.plot_widget = pg.PlotWidget(background="#222")
+        layout.addWidget(self.plot_widget)
+
+        # --- Plot setup ---
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.setLabel("bottom", "Time", units="s")
+        self.plot_widget.setLabel("left", "Usage", units="%")
+        self.plot_widget.setYRange(0, 100)
+        self.plot_widget.addLegend()
+
+        # Lines for CPU, RAM, GPU
+        self.cpu_line = self.plot_widget.plot(pen=pg.mkPen("y", width=2), name="CPU")
+        self.ram_line = self.plot_widget.plot(pen=pg.mkPen("r", width=2), name="RAM")
+        self.gpu_line = self.plot_widget.plot(pen=pg.mkPen("c", width=2), name="GPU")
+
+        # Buffers (180 data points ≈ 3 min at 1 Hz)
+        self.max_points = 180
+        self.cpu_data, self.ram_data, self.gpu_data = [], [], []
+        self.time_data = []
+
+        # Prime psutil CPU measurement
+        psutil.cpu_percent(interval=None)
+
+        # Timer for updates
+        self.start_time = time.time()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_data)
+        self.timer.start(1000)  # every 1 s
+
+    def update_data(self):
+        now = time.time() - self.start_time
+        cpu = psutil.cpu_percent(interval=None)
+        ram = psutil.virtual_memory().percent
+
+        try:
+            gpus = GPUtil.getGPUs()
+            gpu = gpus[0].load * 100 if gpus else 0
+        except Exception:
+            gpu = 0
+
+        # Append new samples
+        self.time_data.append(now)
+        self.cpu_data.append(cpu)
+        self.ram_data.append(ram)
+        self.gpu_data.append(gpu)
+
+        # Keep only last 180 samples
+        if len(self.time_data) > self.max_points:
+            self.time_data = self.time_data[-self.max_points:]
+            self.cpu_data = self.cpu_data[-self.max_points:]
+            self.ram_data = self.ram_data[-self.max_points:]
+            self.gpu_data = self.gpu_data[-self.max_points:]
+
+        # Update plot lines
+        self.cpu_line.setData(self.time_data, self.cpu_data)
+        self.ram_line.setData(self.time_data, self.ram_data)
+        self.gpu_line.setData(self.time_data, self.gpu_data)
 
 class ChartWidget(QLabel):
     def __init__(self, text, parent=None):
