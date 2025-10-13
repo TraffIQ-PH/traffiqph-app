@@ -1,8 +1,8 @@
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QToolBar, QMenuBar, QDialog, QLineEdit, QFormLayout, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QMessageBox, QStatusBar, QCheckBox, QGroupBox, QLabel, QFileDialog, QComboBox, QWidget, QSizePolicy, QSplitter,
-                                QDockWidget, QTextEdit, QProgressBar)
-from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray, QTimer
+                                QDockWidget, QTextEdit, QProgressBar, QListWidget, QListWidgetItem)
+from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray, QTimer, QDateTime
 from PySide6.QtGui import QIcon, QAction, QIntValidator, QRegularExpressionValidator
 import pyqtgraph as pg
 import json
@@ -12,8 +12,8 @@ import GPUtil
 import time
 from threading import Thread, Event
 
-from inference import run_in_qt_mode
-from classes import Camera
+from inference import Inferencer
+from classes import Camera, LatencyTracker
 
 asset_path = str(Path(__file__).parent / "assets")
 
@@ -26,6 +26,8 @@ class MainWindow(QMainWindow):
 
         # Qsettings
         self.settings = QSettings("Lanaia Robotics", "TraffIQ-PH")
+
+        self.latency_tracker = LatencyTracker()
 
         # Hint docks and load layout
         self.load_layout()
@@ -60,14 +62,19 @@ class MainWindow(QMainWindow):
             self.yolo_stop_flag.set()
             self.yolo_thread.join(timeout=2)
             print("[INFO] Previous YOLO thread stopped.")
+        
+        for lbl in self.cam_labels:
+            lbl.clear()
+            lbl.setText("Missing camera source")
+            lbl.setAlignment(Qt.AlignCenter)
 
         # Create a new stop flag for the new thread
         self.yolo_stop_flag = Event()
 
         # Start YOLO again
+        self.inferencer = Inferencer(self.cam_labels, self.cameras, self.yolo_stop_flag, self.latency_tracker)
         self.yolo_thread = Thread(
-            target=run_in_qt_mode,
-            args=(self.cam_labels, self.cameras, self.yolo_stop_flag),
+            target=self.inferencer.run,
             daemon=True
         )
         self.yolo_thread.start()
@@ -169,7 +176,6 @@ class MainWindow(QMainWindow):
                     "heavy": True,
                 },
                 "osd": {
-                    "date": True,
                     "name": True,
                     "location": False,
                     "traffic_phase": True,
@@ -242,6 +248,7 @@ class MainWindow(QMainWindow):
         self.cameras.clear()
         for entry in payload.get("cameras", []):
             self.cameras.append(Camera(**entry))
+        self.start_yolo()
 
         # restore other settings
         self.display_settings = payload.get("display_settings", {})
@@ -256,7 +263,7 @@ class MainWindow(QMainWindow):
         # also update QSettings so it’s consistent
         self.save_all_settings()
 
-        self._log_message(f"Successfully loaded settings from {path}.")
+        self._log_message(f"Successfully loaded settings from {path}.", 2000)
 
     def _save_as_configs(self):
         """Export settings to a JSON file."""
@@ -317,6 +324,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, duration)
         self.logs = [message] + self.logs
         self.dock_logs.widget().setText("\n\n".join(self.logs))
+    
     # Overriden
 
     def resizeEvent(self, event):
@@ -383,6 +391,7 @@ class MainToolBar(QToolBar):
 
         # Add actions
         self.actionAddSource()
+        self.actionRemoveSource()
         self.actionChangeDisplaySettings()
         self.actionEditRegion()
         self.actionChangeExperimentalSettings()
@@ -393,6 +402,15 @@ class MainToolBar(QToolBar):
         action.setStatusTip("Add RTSP source.")
         action.setToolTip("Add RTSP source.")
         action.triggered.connect(self._add_source)
+
+        self.addAction(action)
+    
+    def actionRemoveSource(self):
+        """ Remove RTSP source. """
+        action = QAction(QIcon(f"{asset_path}/remove.png"), "Remove", self)
+        action.setStatusTip("Remove RTSP source.")
+        action.setToolTip("Remove RTSP source.")
+        action.triggered.connect(self._remove_source)
 
         self.addAction(action)
     
@@ -441,6 +459,28 @@ class MainToolBar(QToolBar):
                 self.parent()._log_message("Successfully added camera.", 3000)
                 print(f"Camera added: {camera}")
     
+    def _remove_source(self):
+        dialog = RemoveSourceDialog(self)
+        if dialog.exec():
+            indexes = dialog.get_selected_indexes()
+            if not indexes:
+                QMessageBox.information(self, "No Selection", "No cameras were selected for removal.")
+                return
+
+            # remove from end to start (so indices remain valid)
+            for idx in sorted(indexes, reverse=True):
+                removed_cam = self.parent().cameras.pop(idx)
+                print(f"[INFO] Removed camera: {removed_cam.name} ({removed_cam.ip_address})")
+
+            # save updated list
+            self.parent().save_cameras()
+
+            # restart YOLO backend
+            self.parent().start_yolo()
+
+            self.parent()._log_message("Camera(s) removed and YOLO restarted.", 3000)
+
+
     def _change_display_settings(self):
         dialog = ChangeDisplaySettingsDialog(self.window())
         dialog.set_settings(self.parent().display_settings) # load defaults
@@ -548,7 +588,53 @@ class AddSourceDialog(QDialog):
             "channel": int(self.channel_edit.text().strip()),
             "location": self.location_edit.text().strip(),
         }
+    
+class RemoveSourceDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Remove Camera Source(s)")
+        self.setMinimumWidth(400)
+        self.parent_window = parent.parent()  # reference to MainWindow
 
+        layout = QVBoxLayout(self)
+
+        # --- List of cameras ---
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QListWidget.MultiSelection)
+        self.list_widget.setAlternatingRowColors(True)
+
+        # populate from parent's cameras
+        for i, cam in enumerate(self.parent_window.cameras):
+            item_text = f"{i+1}. {cam.name} — {cam.ip_address} ({cam.location})"
+            item = QListWidgetItem(item_text)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.list_widget.addItem(item)
+
+        layout.addWidget(self.list_widget)
+
+        # --- Buttons ---
+        btn_layout = QHBoxLayout()
+        self.remove_btn = QPushButton("Remove Selected")
+        self.cancel_btn = QPushButton("Cancel")
+        btn_layout.addWidget(self.remove_btn)
+        btn_layout.addWidget(self.cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+        # --- Connections ---
+        self.remove_btn.clicked.connect(self.accept)
+        self.cancel_btn.clicked.connect(self.reject)
+
+    def get_selected_indexes(self):
+        """Return indexes of selected (checked) cameras."""
+        indexes = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                indexes.append(i)
+        return indexes
+    
 class AddVideoSourceDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -608,13 +694,11 @@ class ChangeDisplaySettingsDialog(QDialog):
         osd_layout = QVBoxLayout()
         osd_layout.addWidget(QLabel("Choose which information to overlay:"))
 
-        self.cb_date = QCheckBox("Date")
         self.cb_name = QCheckBox("Name")
         self.cb_location = QCheckBox("Location")
         self.cb_phase = QCheckBox("Traffic Phase")
         self.cb_congestion = QCheckBox("Estimated Congestion")
 
-        osd_layout.addWidget(self.cb_date)
         osd_layout.addWidget(self.cb_name)
         osd_layout.addWidget(self.cb_location)
         osd_layout.addWidget(self.cb_phase)
@@ -659,7 +743,6 @@ class ChangeDisplaySettingsDialog(QDialog):
                 "heavy": self.cb_heavy.isChecked(),
             },
             "osd": {
-                "date": self.cb_date.isChecked(),
                 "name": self.cb_name.isChecked(),
                 "location": self.cb_location.isChecked(),
                 "traffic_phase": self.cb_phase.isChecked(),
@@ -680,7 +763,6 @@ class ChangeDisplaySettingsDialog(QDialog):
         self.cb_light.setChecked(bb.get("light", False))
         self.cb_heavy.setChecked(bb.get("heavy", False))
 
-        self.cb_date.setChecked(osd.get("date", False))
         self.cb_name.setChecked(osd.get("name", False))
         self.cb_location.setChecked(osd.get("location", False))
         self.cb_phase.setChecked(osd.get("traffic_phase", False))
@@ -750,10 +832,10 @@ class CameraWidget(QSplitter):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        cam1 = self.make_camera_widget("Camera 1")
-        cam2 = self.make_camera_widget("Camera 2")
-        cam3 = self.make_camera_widget("Camera 3")
-        cam4 = self.make_camera_widget("Camera 4")
+        cam1 = self.make_camera_widget("Missing camera source")
+        cam2 = self.make_camera_widget("Missing camera source")
+        cam3 = self.make_camera_widget("Missing camera source")
+        cam4 = self.make_camera_widget("Missing camera source")
 
         # top row (cam1 | cam2)
         self.top_split = QSplitter(Qt.Horizontal)
@@ -801,11 +883,20 @@ class MetricsWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("System Metrics")
-        self.setFixedSize(250, 160)
+        self.setFixedSize(250, 250)
 
         layout = QFormLayout()
         layout.setVerticalSpacing(4)
         layout.setHorizontalSpacing(10)
+
+        self.date_label = QLabel()
+        self.date_label.setAlignment(Qt.AlignCenter)
+        self.date_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+
+        self.time_label = QLabel()
+        self.time_label.setAlignment(Qt.AlignCenter)
+        self.time_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        
 
         self.cpu_bar = QProgressBar()
         self.cpu_bar.setRange(0, 100)
@@ -826,11 +917,23 @@ class MetricsWidget(QWidget):
         self.gpu_bar.setTextVisible(True)
 
         self.uptime_label = QLabel("-- s")
+        self.fps_label = QLabel("--")
+        self.latency_total = QLabel("-- ms")
+        self.latency_camera = QLabel("-- ms")
+        self.latency_inference = QLabel("-- ms")
+        self.latency_display = QLabel("-- ms")
 
+        layout.addRow(self.date_label)
+        layout.addRow(self.time_label)
         layout.addRow(QLabel("CPU:"), self.cpu_bar)
         layout.addRow(QLabel("RAM:"), self.ram_bar)
         layout.addRow(QLabel("GPU:"), self.gpu_bar)
         layout.addRow(QLabel("Uptime:"), self.uptime_label)
+        layout.addRow(QLabel("FPS:"), self.fps_label)
+        layout.addRow(QLabel("Total Delay:"), self.latency_total)
+        layout.addRow(QLabel("Cam Delay:"), self.latency_camera)
+        layout.addRow(QLabel("Inf Delay:"), self.latency_inference)
+        layout.addRow(QLabel("Disp Delay:"), self.latency_display)
 
         self.setLayout(layout)
 
@@ -857,6 +960,19 @@ class MetricsWidget(QWidget):
 
         uptime = int(time.time() - self.start_time)
         self.uptime_label.setText(f"{uptime} s")
+
+        current = QDateTime.currentDateTime()
+        self.date_label.setText(current.toString("dddd, MMMM dd yyyy"))
+        self.time_label.setText(current.toString("hh:mm:ss ap"))
+
+        summary = self.parent().parent().latency_tracker.summary()
+
+        self.fps_label.setText(f"{len(self.parent().parent().cameras) / summary['total']:.1f}")
+        self.latency_total.setText(f"{summary['total']*1000:.1f} ms")
+        self.latency_camera.setText(f"{summary['capture']*1000:.1f} ms")
+        self.latency_inference.setText(f"{summary['inference']*1000:.1f} ms")
+        self.latency_display.setText(f"{summary['display']*1000:.1f} ms")
+
 
 class LogsWidget(QTextEdit):
     def __init__(self, parent=None):
