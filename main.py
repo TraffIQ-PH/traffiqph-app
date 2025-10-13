@@ -1,5 +1,5 @@
 def main():
-    print("Hello from qt!")
+    print("Hello from traffiq-app!")
 
 
 if __name__ == "__main__":

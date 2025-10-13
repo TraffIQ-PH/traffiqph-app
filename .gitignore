@@ -15,3 +15,5 @@ settings/
 chatgpt.py
 videos/
 *.json
+yolo/
+*.pt

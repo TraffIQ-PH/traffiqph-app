@@ -1,8 +1,8 @@
 version = 1
 revision = 2
-requires-python = ">=3.11"
+requires-python = ">=3.10.12"
 
 [[package]]
-name = "qt"
+name = "traffiq-app"
 version = "0.1.0"
 source = { virtual = "." }

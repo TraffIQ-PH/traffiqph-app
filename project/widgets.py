@@ -13,6 +13,7 @@ import GPUtil
 import time
 from threading import Thread
 
+import inference as yolo_gst
 from classes import Camera
 
 asset_path = str(Path(__file__).parent / "assets")
@@ -29,6 +30,7 @@ class MainWindow(QMainWindow):
 
         # Hint docks and load layout
         self.load_layout()
+        Thread(target=self.start_yolo, daemon=True).start()
 
         # Menu bar
         menu_bar = MenuBar(self)
@@ -51,12 +53,15 @@ class MainWindow(QMainWindow):
         self.logs = []
         self.load_all_settings()
     
+    def start_yolo(self):
+        yolo_gst.run_in_qt_mode(self.cam_labels)  # new function
+
     def load_layout(self):
         """ Load layout. """
         self.camera_widget = CameraWidget()
         self.metrics_widget = MetricsWidget()
         self.logs_widget = LogsWidget()
-        self.chart_left_widget = ChartWidget("Live Chart A")
+        self.chart_left_widget = HeatmapChartWidget("Heatmap Chart")
         self.chart_right_widget = MetricsChartWidget()
 
         self.cam_labels = [
@@ -73,7 +78,7 @@ class MainWindow(QMainWindow):
         self.dock_logs = self._add_dock("Logs", self.logs_widget, Qt.RightDockWidgetArea)
         self.splitDockWidget(self.dock_metrics, self.dock_logs, Qt.Vertical)
         self.dock_chart_left = self._add_dock("Live Chart A", self.chart_left_widget, Qt.BottomDockWidgetArea)
-        self.dock_chart_right = self._add_dock("Live Chart B", self.chart_right_widget, Qt.BottomDockWidgetArea)
+        self.dock_chart_right = self._add_dock("System Metrics Chart", self.chart_right_widget, Qt.BottomDockWidgetArea)
         self.splitDockWidget(self.dock_chart_left, self.dock_chart_right, Qt.Horizontal)
         self.resizeDocks([self.dock_cameras, self.dock_chart_left], [700, 200], Qt.Vertical)
     
@@ -746,8 +751,9 @@ class CameraWidget(QSplitter):
     def make_camera_widget(self, text):
         lbl = QLabel(text)
         lbl.setAlignment(Qt.AlignCenter)
-        lbl.setStyleSheet("background: #4477aa; color: white; border: 1px solid black;")
-        lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        lbl.setStyleSheet("background: #772953; color: white; border: 1px solid black;")
+        lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        lbl.setScaledContents(False)
         return lbl
 
     def save_camera_layout(self):
@@ -899,7 +905,7 @@ class MetricsChartWidget(QWidget):
         self.ram_line.setData(self.time_data, self.ram_data)
         self.gpu_line.setData(self.time_data, self.gpu_data)
 
-class ChartWidget(QLabel):
+class HeatmapChartWidget(QLabel):
     def __init__(self, text, parent=None):
         super().__init__(parent)
 
