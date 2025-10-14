@@ -1,16 +1,21 @@
 from dataclasses import dataclass
 from collections import deque
 import numpy as np
+from typing import Literal
 
 @dataclass
-class Camera:
+class BaseCamera:
     name: str
+    location: str
+    max_cap: int
+
+@dataclass
+class Camera(BaseCamera):
     ip_address: str
     username: str
     password: str
     rtsp_port: int
     channel: int
-    location: str
     
     def __post_init__(self):
         self.full_link = f'rtsp://{self.username}:{self.password}@{self.ip_address}:{self.rtsp_port}/Streaming/Channels/{self.channel}'
@@ -19,14 +24,9 @@ class Camera:
         return f"Camera: {self.name} at {self.full_link}"
 
 @dataclass
-class ProxyCamera:
-    name: str
-    location: str
+class ProxyCamera(BaseCamera):
     file_path: str
 
-@dataclass
-class InferenceConfig:
-    allowed_classes: list
 
 class LatencyTracker:
     def __init__(self, window=300):

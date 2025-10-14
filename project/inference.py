@@ -14,7 +14,7 @@ from gi.repository import Gst # type: ignore
 Gst.init(None)
 
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Slot
 import torch
 from ultralytics import YOLO
 from classes import Camera, ProxyCamera
@@ -74,11 +74,12 @@ class Cam:
     alive: bool = True
 
 class Inferencer:
-    def __init__(self, label_widgets, target_sources, stop_flag, latency_tracker):
+    def __init__(self, label_widgets, target_sources, stop_flag, latency_tracker, display_settings):
         self.label_widgets = label_widgets
         self.target_sources = target_sources
         self.stop_flag = stop_flag
         self.latency_tracker = latency_tracker
+        self.display_settings = display_settings
 
     def build_pipeline(self, rtsp_url: str, w: int | None = None, h: int | None = None) -> str:
         """
@@ -183,12 +184,18 @@ class Inferencer:
         if results:
             class_names = results[0].names
             for r, i in zip(results, idx_map):
+                num_objs = 0
                 if r.boxes is not None and len(r.boxes) > 0:
                     xyxy = r.boxes.xyxy.cpu().numpy()
                     conf = r.boxes.conf.unsqueeze(1).cpu().numpy()
                     cls  = r.boxes.cls.unsqueeze(1).cpu().numpy()
                     boxes = np.concatenate([xyxy, conf, cls], axis=1)
                     frames[i] = self.draw_boxes(frames[i], boxes, class_names)
+
+                    num_objs = len(r.boxes.cls)
+
+                cam = self.target_sources[i]  # the corresponding camera or proxy
+                frames[i] = self.draw_osd(frames[i], cam, num_objs)
 
         # Display all frames
         for i, frame in enumerate(frames):
@@ -205,6 +212,81 @@ class Inferencer:
             ))
 
         self.latency_tracker.record_display(time.perf_counter() - display_start)
+
+    def draw_osd(self, frame, cam, num_objs):
+        """
+        Draw On-Screen Display (OSD) info such as camera name, location,
+        and congestion. Background size auto-adjusts to text content.
+        """
+        if not hasattr(self, "display_settings"):
+            return frame
+
+        display_settings = getattr(self, "display_settings", {})
+        osd = display_settings.get("osd", {})
+
+        # --- Adjustable visual parameters ---
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.45
+        thickness = 1
+        line_h = int(25 * scale)
+        padding = 10
+        margin_x = 10
+        margin_y = 10
+        color = (255, 255, 255)
+        bg_color = (30, 30, 30)
+        alpha = 0.3
+
+        # --- Generate all text lines to draw ---
+        lines = []
+        if osd.get("name", False):
+            lines.append(f"Cam: {getattr(cam, 'name', 'Unknown')}")
+        if osd.get("location", False):
+            lines.append(f"Loc: {getattr(cam, 'location', 'Unknown')}")
+        if osd.get("estimated_congestion", False):
+            try:
+                max_cap = int(getattr(cam, 'max_cap', 100))
+            except (ValueError, TypeError):
+                max_cap = 100
+            congestion_ratio = num_objs / max_cap if max_cap > 0 else 0
+            lines.append(f"Congestion: {congestion_ratio:.2f}")
+
+        if not lines:
+            return frame
+
+        # --- Compute dynamic size using cv2.getTextSize ---
+        text_widths = []
+        for text in lines:
+            (tw, _), _ = cv2.getTextSize(text, font, scale, thickness)
+            text_widths.append(tw)
+
+        rect_width = padding * 2 + max(text_widths)
+        rect_height = padding * 2 + line_h * len(lines)
+
+        # --- Draw translucent background ---
+        overlay = frame.copy()
+        cv2.rectangle(
+            overlay,
+            (margin_x, margin_y),
+            (margin_x + rect_width, margin_y + rect_height),
+            bg_color,
+            -1
+        )
+        frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+
+        # --- Draw text lines ---
+        y = margin_y + padding + int(line_h * 0.8)
+        for text in lines:
+            cv2.putText(frame, text, (margin_x + padding, y),
+                        font, scale, color, thickness, cv2.LINE_AA)
+            y += line_h
+
+        return frame
+
+
+    @Slot(dict)
+    def on_display_settings_changed(self, display_dict):
+        self.display_settings = display_dict.copy()
+        print(f"[INFO] OSD settings updated: {self.display_settings}")
 
     def run(self):
         if not self.target_sources:

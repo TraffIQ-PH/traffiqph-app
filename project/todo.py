@@ -1,7 +1,7 @@
-# TODO: Use video as source.
+# TODO: BBox [obstructions, two-wheeled, light, heavy].
+# TODO: Notify.
 # TODO: Tracking and obstructions.
 # TODO: Edit ROI.
-# TODO: OSD.
-# TODO: Notify.
+
 # TODO: Send data to RPi.
 # TODO: Left chart

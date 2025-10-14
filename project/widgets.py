@@ -1,8 +1,8 @@
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QToolBar, QMenuBar, QDialog, QLineEdit, QFormLayout, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QMessageBox, QStatusBar, QCheckBox, QGroupBox, QLabel, QFileDialog, QComboBox, QWidget, QSizePolicy, QSplitter,
-                                QDockWidget, QTextEdit, QProgressBar, QListWidget, QListWidgetItem)
-from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray, QTimer, QDateTime, QFileInfo
+                                QDockWidget, QTextEdit, QProgressBar, QListWidget, QListWidgetItem, QScrollArea)
+from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray, QTimer, QDateTime, QFileInfo, Signal
 from PySide6.QtGui import QIcon, QAction, QIntValidator, QRegularExpressionValidator
 import pyqtgraph as pg
 import json
@@ -18,6 +18,10 @@ from classes import Camera, LatencyTracker, ProxyCamera
 asset_path = str(Path(__file__).parent / "assets")
 
 class MainWindow(QMainWindow):
+
+    # Signals -- defined outside init
+    display_settings_changed = Signal(dict)
+
     def __init__(self, app: QApplication):
         super().__init__()
         self.setWindowTitle("TraffIQ-PH Control Panel")
@@ -27,6 +31,7 @@ class MainWindow(QMainWindow):
         # Qsettings
         self.settings = QSettings("Lanaia Robotics", "TraffIQ-PH")
 
+        # Metrics tracker
         self.latency_tracker = LatencyTracker()
 
         # Hint docks and load layout
@@ -58,7 +63,8 @@ class MainWindow(QMainWindow):
         self.start_yolo()
 
     def start_yolo(self):
-    # Stop existing YOLO thread
+
+        # Stop existing YOLO thread
         if hasattr(self, "yolo_thread") and self.yolo_thread.is_alive():
             self.yolo_stop_flag.set()
             self.yolo_thread.join(timeout=2)
@@ -78,11 +84,13 @@ class MainWindow(QMainWindow):
         else:
             target_source = self.cameras
 
-        self.inferencer = Inferencer(self.cam_labels, target_source, self.yolo_stop_flag, self.latency_tracker)
+        self.inferencer = Inferencer(self.cam_labels, target_source, self.yolo_stop_flag, self.latency_tracker, self.display_settings)
         self.yolo_thread = Thread(
             target=self.inferencer.run,
             daemon=True
         )
+        self.display_settings_changed.connect(self.inferencer.on_display_settings_changed)
+
         self.yolo_thread.start()
 
         self._log_message("YOLO restarted with updated camera list.", 3000)
@@ -196,7 +204,6 @@ class MainWindow(QMainWindow):
                 "osd": {
                     "name": True,
                     "location": False,
-                    "traffic_phase": True,
                     "estimated_congestion": True,
                 },
                 "logs": {
@@ -494,27 +501,39 @@ class MainToolBar(QToolBar):
                 self.parent().start_yolo()
                 self.parent()._log_message("Successfully added camera.", 3000)
                 print(f"Camera added: {camera}")
-    
+
     def _remove_source(self):
+        """Removes selected real and proxy cameras."""
         dialog = RemoveSourceDialog(self)
         if dialog.exec():
-            indexes = dialog.get_selected_indexes()
-            if not indexes:
-                QMessageBox.information(self, "No Selection", "No cameras were selected for removal.")
+            selected = dialog.get_selected_indexes()
+            cam_indexes = selected.get("cameras", [])
+            proxy_indexes = selected.get("proxies", [])
+
+            if not cam_indexes and not proxy_indexes:
+                QMessageBox.information(self, "No Selection", "No sources were selected for removal.")
                 return
 
-            # remove from end to start (so indices remain valid)
-            for idx in sorted(indexes, reverse=True):
-                removed_cam = self.parent().cameras.pop(idx)
-                print(f"[INFO] Removed camera: {removed_cam.name} ({removed_cam.ip_address})")
+            # --- Remove from both lists safely (reverse order to avoid index shift) ---
+            # Real cameras
+            for idx in sorted(cam_indexes, reverse=True):
+                if 0 <= idx < len(self.parent().cameras):
+                    removed_cam = self.parent().cameras.pop(idx)
+                    print(f"[INFO] Removed camera: {removed_cam.name} ({removed_cam.ip_address})")
 
-            # save updated list
+            # Proxy cameras
+            for idx in sorted(proxy_indexes, reverse=True):
+                if 0 <= idx < len(self.parent().proxy_cameras):
+                    removed_proxy = self.parent().proxy_cameras.pop(idx)
+                    print(f"[INFO] Removed proxy camera: {removed_proxy.name} ({removed_proxy.file_path})")
+
+            # --- Save updated lists ---
             self.parent().save_cameras()
 
-            # restart YOLO backend
+            # --- Restart YOLO backend ---
             self.parent().start_yolo()
 
-            self.parent()._log_message("Camera(s) removed and YOLO restarted.", 3000)
+            self.parent()._log_message("Selected source(s) removed and YOLO restarted.", 3000)
 
 
     def _change_display_settings(self):
@@ -527,6 +546,8 @@ class MainToolBar(QToolBar):
             self.parent().save_all_settings()
             self.parent()._log_message("Updated display settings", 3000)
             print("User settings:", settings)
+        
+            self.parent().display_settings_changed.emit(self.parent().display_settings)
         
     def _edit_region(self):
         print("Edit region of interest")
@@ -572,10 +593,12 @@ class AddSourceDialog(QDialog):
         self.channel_edit = QLineEdit()
         self.password_edit = QLineEdit()
         self.location_edit = QLineEdit()
+        self.max_cap_edit = QLineEdit()
         self.line_edit_fields: list[QLineEdit] = [self.name_edit, self.address_edit, self.username_edit, self.port_edit,
-                                 self.channel_edit, self.password_edit, self.location_edit]
+                                 self.channel_edit, self.password_edit, self.location_edit, self.max_cap_edit]
 
         self.port_edit.setValidator(QIntValidator(1, 65535, self))
+        self.max_cap_edit.setValidator(QIntValidator(1, 65535, self))
         self.channel_edit.setValidator(QIntValidator(1, 512, self))
         self.password_edit.setEchoMode(QLineEdit.Password)
         ip_regex = QRegularExpression(
@@ -591,10 +614,12 @@ class AddSourceDialog(QDialog):
         layout.addRow("Camera Name:", self.name_edit)
         layout.addRow("Location:", self.location_edit)
         layout.addRow("IP Address:", self.address_edit)
+        layout.addRow("Max cap:", self.max_cap_edit)
         layout.addRow("Username:", self.username_edit)
         layout.addRow("Password:", self.password_edit)
         layout.addRow("RTSP Port:", self.port_edit)
         layout.addRow("Channel:", self.channel_edit)
+        
         
 
         # Button
@@ -625,54 +650,102 @@ class AddSourceDialog(QDialog):
             "rtsp_port": int(self.port_edit.text().strip()),
             "channel": int(self.channel_edit.text().strip()),
             "location": self.location_edit.text().strip(),
+            "max_cap": self.max_cap_edit.text().strip(),
         }
     
 class RemoveSourceDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Remove Camera Source(s)")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(800)
         self.parent_window = parent.parent()  # reference to MainWindow
 
-        layout = QVBoxLayout(self)
+        main_layout = QVBoxLayout(self)
 
-        # --- List of cameras ---
-        self.list_widget = QListWidget()
-        self.list_widget.setSelectionMode(QListWidget.MultiSelection)
-        self.list_widget.setAlternatingRowColors(True)
+        # ==============================
+        # --- Two Columns (GroupBoxes) ---
+        # ==============================
+        columns_layout = QHBoxLayout()
 
-        # populate from parent's cameras
+        # --- Camera Sources GroupBox ---
+        self.camera_group = QGroupBox("Camera Sources")
+        cam_layout = QVBoxLayout(self.camera_group)
+        self.camera_list = QListWidget()
+        self.camera_list.setSelectionMode(QListWidget.MultiSelection)
+        self.camera_list.setAlternatingRowColors(True)
+        cam_layout.addWidget(self.camera_list)
+
+        # populate camera list
         for i, cam in enumerate(self.parent_window.cameras):
             item_text = f"{i+1}. {cam.name} — {cam.ip_address} ({cam.location})"
             item = QListWidgetItem(item_text)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked)
-            self.list_widget.addItem(item)
+            self.camera_list.addItem(item)
 
-        layout.addWidget(self.list_widget)
+        # --- Proxy Camera Sources GroupBox ---
+        self.proxy_group = QGroupBox("Proxy Camera Sources")
+        proxy_layout = QVBoxLayout(self.proxy_group)
+        self.proxy_list = QListWidget()
+        self.proxy_list.setSelectionMode(QListWidget.MultiSelection)
+        self.proxy_list.setAlternatingRowColors(True)
+        proxy_layout.addWidget(self.proxy_list)
 
+        # populate proxy list
+        for i, proxy in enumerate(self.parent_window.proxy_cameras):
+            item_text = f"{i+1}. {proxy.name} — {proxy.file_path} ({proxy.location})"
+            item = QListWidgetItem(item_text)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.proxy_list.addItem(item)
+
+        # --- Make both scrollable ---
+        cam_scroll = QScrollArea()
+        cam_scroll.setWidgetResizable(True)
+        cam_scroll.setWidget(self.camera_group)
+
+        proxy_scroll = QScrollArea()
+        proxy_scroll.setWidgetResizable(True)
+        proxy_scroll.setWidget(self.proxy_group)
+
+        # --- Add to horizontal layout ---
+        columns_layout.addWidget(cam_scroll)
+        columns_layout.addWidget(proxy_scroll)
+        main_layout.addLayout(columns_layout)
+
+        # ==============================
         # --- Buttons ---
+        # ==============================
         btn_layout = QHBoxLayout()
         self.remove_btn = QPushButton("Remove Selected")
         self.cancel_btn = QPushButton("Cancel")
         btn_layout.addWidget(self.remove_btn)
         btn_layout.addWidget(self.cancel_btn)
-
-        layout.addLayout(btn_layout)
+        main_layout.addLayout(btn_layout)
 
         # --- Connections ---
         self.remove_btn.clicked.connect(self.accept)
         self.cancel_btn.clicked.connect(self.reject)
 
+
     def get_selected_indexes(self):
-        """Return indexes of selected (checked) cameras."""
-        indexes = []
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
+        """Return dict of selected (checked) cameras and proxy cameras."""
+        selected = {"cameras": [], "proxies": []}
+
+        # regular cameras
+        for i in range(self.camera_list.count()):
+            item = self.camera_list.item(i)
             if item.checkState() == Qt.Checked:
-                indexes.append(i)
-        return indexes
-    
+                selected["cameras"].append(i)
+
+        # proxy cameras
+        for i in range(self.proxy_list.count()):
+            item = self.proxy_list.item(i)
+            if item.checkState() == Qt.Checked:
+                selected["proxies"].append(i)
+
+        return selected
+
 class AddVideoSourceDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -701,6 +774,10 @@ class AddVideoSourceDialog(QDialog):
         self.location_edit = QLineEdit()
         form_layout.addRow("Location:", self.location_edit)
 
+        # Max cap field
+        self.max_cap_edit = QLineEdit()
+        form_layout.addRow("Max cap:", self.max_cap_edit)
+
         # File picker
         file_layout = QHBoxLayout()
         self.file_edit = QLineEdit()
@@ -711,7 +788,7 @@ class AddVideoSourceDialog(QDialog):
         file_layout.addWidget(self.browse_btn)
         form_layout.addRow("Video File:", file_layout)
 
-        self.line_edit_fields = [self.name_edit, self.location_edit, self.file_edit]
+        self.line_edit_fields = [self.name_edit, self.location_edit, self.file_edit, self.max_cap_edit]
 
         main_layout.addLayout(form_layout)
 
@@ -754,6 +831,7 @@ class AddVideoSourceDialog(QDialog):
             "name": self.name_edit.text().strip(),
             "location": self.location_edit.text().strip(),
             "file_path": self.file_edit.text().strip(),
+            "max_cap": self.max_cap_edit.text().strip(),
         }
 
 class ChangeDisplaySettingsDialog(QDialog):
@@ -789,12 +867,10 @@ class ChangeDisplaySettingsDialog(QDialog):
 
         self.cb_name = QCheckBox("Name")
         self.cb_location = QCheckBox("Location")
-        self.cb_phase = QCheckBox("Traffic Phase")
         self.cb_congestion = QCheckBox("Estimated Congestion")
 
         osd_layout.addWidget(self.cb_name)
         osd_layout.addWidget(self.cb_location)
-        osd_layout.addWidget(self.cb_phase)
         osd_layout.addWidget(self.cb_congestion)
 
         osd_group.setLayout(osd_layout)
@@ -838,7 +914,6 @@ class ChangeDisplaySettingsDialog(QDialog):
             "osd": {
                 "name": self.cb_name.isChecked(),
                 "location": self.cb_location.isChecked(),
-                "traffic_phase": self.cb_phase.isChecked(),
                 "estimated_congestion": self.cb_congestion.isChecked(),
             },
             "logs": {
@@ -858,7 +933,6 @@ class ChangeDisplaySettingsDialog(QDialog):
 
         self.cb_name.setChecked(osd.get("name", False))
         self.cb_location.setChecked(osd.get("location", False))
-        self.cb_phase.setChecked(osd.get("traffic_phase", False))
         self.cb_congestion.setChecked(osd.get("estimated_congestion", False))
         log_level = logs.get("log_level", "Info")   # default to "Info"
         idx = self.cb_log_level.findText(log_level)
