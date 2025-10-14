@@ -198,7 +198,7 @@ class MainWindow(QMainWindow):
             self.display_settings = {
                 "bounding_boxes": {
                     "obstructions": True,
-                    "two_wheeled": True,
+                    "two-wheeled": True,
                     "light": True,
                     "heavy": True,
                 },
@@ -908,7 +908,7 @@ class ChangeDisplaySettingsDialog(QDialog):
         return {
             "bounding_boxes": {
                 "obstructions": self.cb_obstructions.isChecked(),
-                "two_wheeled": self.cb_two_wheeled.isChecked(),
+                "two-wheeled": self.cb_two_wheeled.isChecked(),
                 "light": self.cb_light.isChecked(),
                 "heavy": self.cb_heavy.isChecked(),
             },
@@ -928,7 +928,7 @@ class ChangeDisplaySettingsDialog(QDialog):
         logs = settings.get("logs", {})
 
         self.cb_obstructions.setChecked(bb.get("obstructions", False))
-        self.cb_two_wheeled.setChecked(bb.get("two_wheeled", False))
+        self.cb_two_wheeled.setChecked(bb.get("two-wheeled", False))
         self.cb_light.setChecked(bb.get("light", False))
         self.cb_heavy.setChecked(bb.get("heavy", False))
 
@@ -1023,7 +1023,7 @@ class CameraWidget(QSplitter):
     def make_camera_widget(self, text):
         lbl = QLabel(text)
         lbl.setAlignment(Qt.AlignCenter)
-        lbl.setStyleSheet("background: #772953; color: white; border: 1px solid black;")
+        lbl.setStyleSheet("background: #111111; color: white; border: 1px solid black;")
         lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         lbl.setScaledContents(False)
         return lbl

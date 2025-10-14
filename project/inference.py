@@ -21,7 +21,7 @@ from classes import Camera, ProxyCamera
 
 
 # --- CONFIG ---
-MODEL_PATH = str(Path(__file__).parent.parent / "yolo" / "yolo11x.pt")  # adjust to your model
+MODEL_PATH = str(Path(__file__).parent.parent / "yolo" / "best.pt")  # adjust to your model
 WINDOW = "YOLO 2x2 (low-latency)"
 TILE_W, TILE_H = 640, 360
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -82,21 +82,20 @@ class Inferencer:
         self.display_settings = display_settings
 
     def build_pipeline(self, rtsp_url: str, w: int | None = None, h: int | None = None) -> str:
-        """
-        Builds the GStreamer pipeline.
-        Low-latency pipeline:
-        - small RTSP jitter buffer (latency=50)
-        - decode → convert to BGR
-        - appsink drops old frames and never blocks
-        """
         size_caps = ""
-        if w is not None and h is not None:
+        if w and h:
+            # only apply videoscale if you intentionally want to resize
             size_caps = f" ! videoscale ! video/x-raw,width={w},height={h},format=BGR"
+        else:
+            # keep native resolution, no scaling
+            size_caps = " ! video/x-raw,format=BGR"
+        
         return (
             f'rtspsrc location="{rtsp_url}" latency=50 protocols=tcp ! '
             f'rtph264depay ! h264parse ! avdec_h264 ! videoconvert{size_caps} ! '
             f'appsink name=appsink caps=video/x-raw,format=BGR drop=true max-buffers=1 sync=false'
         )
+
 
 
     def reader_thread(self,cam: Cam):
@@ -129,23 +128,44 @@ class Inferencer:
         bot = np.hstack((tiles[2], tiles[3]))
         return np.vstack((top, bot))
 
-
     def draw_boxes(self, frame, boxes, class_names):
         """
         boxes: (N,6) array [x1,y1,x2,y2,conf,cls]
-        Draws ALL classes so you can see boxes.
+        Draws boxes per class depending on self.display_settings['bounding_boxes'] flags.
         """
         if boxes is None or len(boxes) == 0:
             return frame
+
+        bbox_settings = self.display_settings.get("bounding_boxes", {})
+        CLASS_COLORS = {
+            "obstructions": (0, 165, 255),   # Orange
+            "two-wheeled":  (0, 255, 255),   # Yellow
+            "light":        (0, 255, 0),     # Green
+            "heavy":        (255, 0, 255),   # Purple
+        }
+
         for x1, y1, x2, y2, conf, cls in boxes:
-            name = class_names[int(cls)]
+            cls = int(cls)
+            name = class_names[cls] if cls < len(class_names) else f"cls_{cls}"
+            
+            if not bbox_settings.get(name, True):
+                continue
+
+            color = CLASS_COLORS.get(name, (255, 255, 255))  # default white
+
             x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
             label = f"{name} {float(conf):.2f}"
+
+            # Draw filled label background
             (tw, th), _ = cv2.getTextSize(label, FONT, 0.6, 2)
-            cv2.rectangle(frame, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), (0, 255, 0), -1)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), DRAW_THICKNESS)
+            cv2.rectangle(frame, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), color, -1)
+
+            # Draw main bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, DRAW_THICKNESS)
             cv2.putText(frame, label, (x1 + 3, max(0, y1 - 4)), FONT, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+
         return frame
+
 
     def _init_yolo(self):
         """Initialize YOLO model and send to device."""
@@ -215,8 +235,8 @@ class Inferencer:
 
     def draw_osd(self, frame, cam, num_objs):
         """
-        Draw On-Screen Display (OSD) info such as camera name, location,
-        and congestion. Background size auto-adjusts to text content.
+        Draw On-Screen Display (OSD) info (camera name, location, congestion)
+        scaled relative to video resolution/aspect ratio.
         """
         if not hasattr(self, "display_settings"):
             return frame
@@ -224,19 +244,27 @@ class Inferencer:
         display_settings = getattr(self, "display_settings", {})
         osd = display_settings.get("osd", {})
 
-        # --- Adjustable visual parameters ---
+        h, w, _ = frame.shape
+
+        # --- Compute scale relative to reference resolution ---
+        # Reference = 1280x720; change to your usual baseline
+        base_w, base_h = 1280, 720
+        scale_factor = ((w / base_w) + (h / base_h)) / 2.0  # geometric mean works too
+
+        # --- Adjustable visual parameters scaled ---
         font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.45
-        thickness = 1
-        line_h = int(25 * scale)
-        padding = 10
-        margin_x = 10
-        margin_y = 10
+        base_scale = 0.45
+        scale = base_scale * scale_factor
+        thickness = max(1, int(1 * scale_factor))
+        line_h = int(25 * scale_factor)
+        padding = int(10 * scale_factor)
+        margin_x = int(10 * scale_factor)
+        margin_y = int(10 * scale_factor)
         color = (255, 255, 255)
         bg_color = (30, 30, 30)
         alpha = 0.3
 
-        # --- Generate all text lines to draw ---
+        # --- Generate text lines ---
         lines = []
         if osd.get("name", False):
             lines.append(f"Cam: {getattr(cam, 'name', 'Unknown')}")
@@ -253,16 +281,12 @@ class Inferencer:
         if not lines:
             return frame
 
-        # --- Compute dynamic size using cv2.getTextSize ---
-        text_widths = []
-        for text in lines:
-            (tw, _), _ = cv2.getTextSize(text, font, scale, thickness)
-            text_widths.append(tw)
-
+        # --- Dynamic rectangle size ---
+        text_widths = [cv2.getTextSize(t, font, scale, thickness)[0][0] for t in lines]
         rect_width = padding * 2 + max(text_widths)
         rect_height = padding * 2 + line_h * len(lines)
 
-        # --- Draw translucent background ---
+        # --- Translucent background ---
         overlay = frame.copy()
         cv2.rectangle(
             overlay,
@@ -276,8 +300,11 @@ class Inferencer:
         # --- Draw text lines ---
         y = margin_y + padding + int(line_h * 0.8)
         for text in lines:
-            cv2.putText(frame, text, (margin_x + padding, y),
-                        font, scale, color, thickness, cv2.LINE_AA)
+            cv2.putText(
+                frame, text,
+                (margin_x + padding, y),
+                font, scale, color, thickness, cv2.LINE_AA
+            )
             y += line_h
 
         return frame
@@ -342,7 +369,7 @@ class Inferencer:
         cams = []
 
         for cam in self.target_sources:
-            cap = GstCam(self.build_pipeline(cam.full_link, TILE_W, TILE_H))
+            cap = GstCam(self.build_pipeline(cam.full_link))
             cam = Cam(url=cam.full_link, cap=cap, q=queue.Queue(maxsize=1))
             t = threading.Thread(target=self.reader_thread, args=(cam,), daemon=True)
             t.start()
