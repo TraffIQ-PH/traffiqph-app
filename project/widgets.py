@@ -2,7 +2,7 @@
 from PySide6.QtWidgets import (QApplication, QMainWindow, QToolBar, QMenuBar, QDialog, QLineEdit, QFormLayout, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QMessageBox, QStatusBar, QCheckBox, QGroupBox, QLabel, QFileDialog, QComboBox, QWidget, QSizePolicy, QSplitter,
                                 QDockWidget, QTextEdit, QProgressBar, QListWidget, QListWidgetItem)
-from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray, QTimer, QDateTime
+from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray, QTimer, QDateTime, QFileInfo
 from PySide6.QtGui import QIcon, QAction, QIntValidator, QRegularExpressionValidator
 import pyqtgraph as pg
 import json
@@ -13,7 +13,7 @@ import time
 from threading import Thread, Event
 
 from inference import Inferencer
-from classes import Camera, LatencyTracker
+from classes import Camera, LatencyTracker, ProxyCamera
 
 asset_path = str(Path(__file__).parent / "assets")
 
@@ -47,6 +47,7 @@ class MainWindow(QMainWindow):
 
         # Cameras
         self.cameras: list[Camera] = []
+        self.proxy_cameras: list[ProxyCamera] = []
 
         # Load all settings and configurations
         self.display_settings = {}
@@ -72,7 +73,12 @@ class MainWindow(QMainWindow):
         self.yolo_stop_flag = Event()
 
         # Start YOLO again
-        self.inferencer = Inferencer(self.cam_labels, self.cameras, self.yolo_stop_flag, self.latency_tracker)
+        if self.experimental_settings.get("use_videos", False):
+            target_source = self.proxy_cameras
+        else:
+            target_source = self.cameras
+
+        self.inferencer = Inferencer(self.cam_labels, target_source, self.yolo_stop_flag, self.latency_tracker)
         self.yolo_thread = Thread(
             target=self.inferencer.run,
             daemon=True
@@ -80,7 +86,6 @@ class MainWindow(QMainWindow):
         self.yolo_thread.start()
 
         self._log_message("YOLO restarted with updated camera list.", 3000)
-
 
     def load_layout(self):
         """ Load layout. """
@@ -146,6 +151,19 @@ class MainWindow(QMainWindow):
     def load_all_settings(self):
         """ Load cameras and UI settings from system store. """
 
+        # Load proxy cameras
+        raw_proxies = self.settings.value("proxy_cameras")
+        if raw_proxies:
+            try:
+                data = json.loads(raw_proxies)
+                self.proxy_cameras.clear()
+                for entry in data:
+                    cam = ProxyCamera(**entry)
+                    self.proxy_cameras.append(cam)
+                print(f"Loaded {len(self.proxy_cameras)} proxy cameras from the system.")
+            except Exception as e:
+                print("Error loading cameras:", e)
+        
         # Load cameras
         raw_cams = self.settings.value("cameras")
         if raw_cams:
@@ -158,7 +176,7 @@ class MainWindow(QMainWindow):
                 print(f"Loaded {len(self.cameras)} cameras from the system.")
             except Exception as e:
                 print("Error loading cameras:", e)
-        
+
         # Load display settings
         raw_display = self.settings.value("display_settings")
         if raw_display:
@@ -230,10 +248,14 @@ class MainWindow(QMainWindow):
         self._log_message("All settings have been saved in your computer.", 3000)
 
     def save_cameras(self):
+        """ Saves camera and proxy camera instances. """
         data = [cam.__dict__.copy() for cam in self.cameras]
         for d in data:
             d.pop("full_link", None)
         self.settings.setValue("cameras", json.dumps(data))
+
+        data = [proxy_cam.__dict__.copy() for proxy_cam in self.proxy_cameras]
+        self.settings.setValue("proxy_cameras", json.dumps(data))
 
     def _load_configs(self):
         """Import settings from a JSON file."""
@@ -244,16 +266,22 @@ class MainWindow(QMainWindow):
         with open(path, "r") as f:
             payload = json.load(f)
 
-        # restore cameras
-        self.cameras.clear()
-        for entry in payload.get("cameras", []):
-            self.cameras.append(Camera(**entry))
-        self.start_yolo()
-
         # restore other settings
         self.display_settings = payload.get("display_settings", {})
         self.experimental_settings = payload.get("experimental_settings", {})
         
+        # restore cameras or proxy cameras
+        self.cameras.clear()
+        for entry in payload.get("cameras", []):
+            self.cameras.append(Camera(**entry))
+        
+        self.proxy_cameras.clear()
+        for entry in payload.get("proxy_cameras", []):
+            self.proxy_cameras.append(ProxyCamera(**entry))
+
+        self.start_yolo()
+
+
         # restore layout settings
         self.layout_settings = payload.get("layout", {})
 
@@ -274,6 +302,7 @@ class MainWindow(QMainWindow):
         
         payload = {
             "cameras": [cam.__dict__.copy() for cam in self.cameras],
+            "proxy_cameras": [proxy_cam.__dict__.copy() for proxy_cam in self.proxy_cameras],
             "display_settings": self.display_settings,
             "experimental_settings": self.experimental_settings,
             "layout": self.layout_settings,
@@ -285,7 +314,6 @@ class MainWindow(QMainWindow):
             json.dump(payload, f, indent=4)
         
         self._log_message(f"Successfully saved settings to {path}.")
-
 
     def _save_current_layout(self):
         self._default_geometry = self.saveGeometry()
@@ -447,10 +475,18 @@ class MainToolBar(QToolBar):
         use_video = self.parent().experimental_settings.get("use_videos", False)
         if use_video:
             dialog = AddVideoSourceDialog(self)
-            dialog.exec()
+            if dialog.exec() == QDialog.Accepted:
+                data = dialog.get_data()
+                proxy_camera = ProxyCamera(**data)
+                self.parent().proxy_cameras.append(proxy_camera)
+                self.parent().save_cameras()
+                self.parent().start_yolo()
+                self.parent()._log_message("Successfully added proxy camera.", 3000)
+
+                print(f"Proxy camera '{proxy_camera.name}' added successfully.")
         else:
             dialog = AddSourceDialog(self)
-            if dialog.exec():
+            if dialog.exec() == QDialog.Accepted:
                 data = dialog.get_data()
                 camera = Camera(**data)
                 self.parent().cameras.append(camera) # add current camera to cameras
@@ -509,7 +545,9 @@ class MainToolBar(QToolBar):
 
         if dialog.exec():
             settings = dialog.get_settings()
+            previous_settings = self.parent().experimental_settings["use_videos"]
             self.parent().experimental_settings = settings
+            if settings["use_videos"] != previous_settings: self.parent().start_yolo()
             self.parent().save_all_settings()
             self.parent()._log_message("Updated experimental settings", 3000)
             print("User settings:", settings)
@@ -638,30 +676,85 @@ class RemoveSourceDialog(QDialog):
 class AddVideoSourceDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Add Video Source")
-        self.setMinimumWidth(300)
+        self.setWindowTitle("Add Proxy Video Source")
+        self.setMinimumWidth(400)
+        self.selected_proxy = None  # will hold the created ProxyCamera
 
-        layout = QVBoxLayout()
-        layout.setSpacing(20)
-        self.label = QLabel()
-        self.label.setText("The use videos settings is set to True, please select the video."
-                           "\nOtherwise, change the settings to False to link RTSP streams.")
-        self.btn = QPushButton("Select Video")
-        self.btn.clicked.connect(self.load_video)
-        
-        layout.addWidget(self.label)
-        layout.addWidget(self.btn)
-        
+        # --- Layout setup ---
+        main_layout = QVBoxLayout()
+        form_layout = QFormLayout()
+        form_layout.setSpacing(10)
 
-        self.setLayout(layout)
+        # Info label
+        info_label = QLabel(
+            "The 'Use Videos' setting is enabled.\n"
+            "Fill in the details below to register a proxy camera."
+        )
+        info_label.setWordWrap(True)
+        main_layout.addWidget(info_label)
 
+        # Name field
+        self.name_edit = QLineEdit()
+        form_layout.addRow("Camera Name:", self.name_edit)
+
+        # Location field
+        self.location_edit = QLineEdit()
+        form_layout.addRow("Location:", self.location_edit)
+
+        # File picker
+        file_layout = QHBoxLayout()
+        self.file_edit = QLineEdit()
+        self.file_edit.setReadOnly(True)
+        self.browse_btn = QPushButton("Browse")
+        self.browse_btn.clicked.connect(self.load_video)
+        file_layout.addWidget(self.file_edit)
+        file_layout.addWidget(self.browse_btn)
+        form_layout.addRow("Video File:", file_layout)
+
+        self.line_edit_fields = [self.name_edit, self.location_edit, self.file_edit]
+
+        main_layout.addLayout(form_layout)
+
+        # Buttons
+        self.submit_btn = QPushButton("Add Proxy Camera")
+        self.submit_btn.clicked.connect(self.validate_and_accept)
+        main_layout.addWidget(self.submit_btn, alignment=Qt.AlignRight)
+
+        self.setLayout(main_layout)
+
+    # ------------------------------------------------------
     def load_video(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select a Video File", "", "Video Files (*.mp4 *.avi *.mkv *.mov)")
-
+        """Open file dialog to select a video."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select a Video File",
+            "",
+            "Video Files (*.mp4 *.avi *.mkv *.mov)"
+        )
         if file_path:
-            print("File selected:", file_path)
+            self.file_edit.setText(file_path)
+            # Auto-suggest name and RTSP location if empty
+            base_name = QFileInfo(file_path).baseName()
+            if not self.name_edit.text():
+                self.name_edit.setText(f"Proxy-{base_name}")
+            if not self.location_edit.text():
+                self.location_edit.setText(f"rtsp://127.0.0.1:8554/{base_name}")
 
-        # TODO: continue loading video path
+    def validate_and_accept(self):
+        """ Validates the form and checks if all fields are populated. """
+        if not all([field.text().strip() for field in self.line_edit_fields]):
+            QMessageBox.warning(self, "Missing Data", "Please fill all fields!")
+            return
+
+        self.accept()
+    
+    def get_data(self):
+        """Package dialog data into a dict (or return Camera directly)."""
+        return {
+            "name": self.name_edit.text().strip(),
+            "location": self.location_edit.text().strip(),
+            "file_path": self.file_edit.text().strip(),
+        }
 
 class ChangeDisplaySettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -967,7 +1060,7 @@ class MetricsWidget(QWidget):
 
         summary = self.parent().parent().latency_tracker.summary()
 
-        self.fps_label.setText(f"{len(self.parent().parent().cameras) / summary['total']:.1f}")
+        if summary["total"]: self.fps_label.setText(f"{len(self.parent().parent().cameras) / summary['total']:.1f}")
         self.latency_total.setText(f"{summary['total']*1000:.1f} ms")
         self.latency_camera.setText(f"{summary['capture']*1000:.1f} ms")
         self.latency_inference.setText(f"{summary['inference']*1000:.1f} ms")

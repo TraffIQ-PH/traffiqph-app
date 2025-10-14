@@ -18,6 +18,15 @@ class Camera:
     def __str__(self):
         return f"Camera: {self.name} at {self.full_link}"
 
+@dataclass
+class ProxyCamera:
+    name: str
+    location: str
+    file_path: str
+
+@dataclass
+class InferenceConfig:
+    allowed_classes: list
 
 class LatencyTracker:
     def __init__(self, window=300):

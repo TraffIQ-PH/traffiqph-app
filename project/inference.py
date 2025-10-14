@@ -8,15 +8,16 @@ import numpy as np
 import cv2
 
 # --- GStreamer (PyGObject) ---
-import gi
+import gi # type: ignore
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst
+from gi.repository import Gst # type: ignore
 Gst.init(None)
 
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtCore import Qt
 import torch
 from ultralytics import YOLO
+from classes import Camera, ProxyCamera
 
 
 # --- CONFIG ---
@@ -64,7 +65,6 @@ class GstCam:
     def release(self):
         self.pipeline.set_state(Gst.State.NULL)
 
-
 @dataclass
 class Cam:
     url: str
@@ -73,11 +73,10 @@ class Cam:
     last: Optional[np.ndarray] = None
     alive: bool = True
 
-
 class Inferencer:
-    def __init__(self, label_widgets, cameras, stop_flag, latency_tracker):
+    def __init__(self, label_widgets, target_sources, stop_flag, latency_tracker):
         self.label_widgets = label_widgets
-        self.cameras = cameras
+        self.target_sources = target_sources
         self.stop_flag = stop_flag
         self.latency_tracker = latency_tracker
 
@@ -147,17 +146,12 @@ class Inferencer:
             cv2.putText(frame, label, (x1 + 3, max(0, y1 - 4)), FONT, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
         return frame
 
-    def run(self):
-        """
-        Same as main(), but instead of cv2.imshow(),
-        updates QLabel widgets in a PyQt application.
-        """
-        if not self.cameras:
-            return
-
+    def _init_yolo(self):
+        """Initialize YOLO model and send to device."""
         device = 0 if torch.cuda.is_available() else "cpu"
         model = YOLO(MODEL_PATH)
         model.to(device=device)
+
         if device != "cpu":
             model.fuse()
             try:
@@ -165,16 +159,112 @@ class Inferencer:
             except Exception:
                 pass
 
+        return model, device
+
+    def _batch_infer(self, model, batch_imgs, device):
+        """Run YOLO prediction and record latency."""
+        inf_start = time.perf_counter()
+        preds = model.predict(
+            batch_imgs,
+            imgsz=max(TILE_W, TILE_H),
+            device=device,
+            half=(device != "cpu"),
+            conf=0.25,
+            iou=0.45,
+            verbose=False
+        )
+        self.latency_tracker.record_inference(time.perf_counter() - inf_start)
+        return preds
+
+
+    def _display_frames(self, frames, results, idx_map):
+        """Draw boxes and display frames on their respective QLabel widgets."""
+        display_start = time.perf_counter()
+        if results:
+            class_names = results[0].names
+            for r, i in zip(results, idx_map):
+                if r.boxes is not None and len(r.boxes) > 0:
+                    xyxy = r.boxes.xyxy.cpu().numpy()
+                    conf = r.boxes.conf.unsqueeze(1).cpu().numpy()
+                    cls  = r.boxes.cls.unsqueeze(1).cpu().numpy()
+                    boxes = np.concatenate([xyxy, conf, cls], axis=1)
+                    frames[i] = self.draw_boxes(frames[i], boxes, class_names)
+
+        # Display all frames
+        for i, frame in enumerate(frames):
+            if frame is None:
+                continue
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+            pix = QPixmap.fromImage(qimg)
+            self.label_widgets[i].setPixmap(pix.scaled(
+                self.label_widgets[i].size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            ))
+
+        self.latency_tracker.record_display(time.perf_counter() - display_start)
+
+    def run(self):
+        if not self.target_sources:
+            return
+        if isinstance(self.target_sources[0], Camera):
+            self.run_rtsp_mode()
+        if isinstance(self.target_sources[0], ProxyCamera):
+            self.run_video_mode()
+
+    def run_video_mode(self):
+        model, device = self._init_yolo()
+        caps = []
+
+        # OpenCV-based sources (ProxyCamera.file_path)
+        for proxy in self.target_sources:
+            cap = cv2.VideoCapture(proxy.file_path)
+            if not cap.isOpened():
+                print(f"[ERROR] Cannot open video: {proxy.file_path}")
+                continue
+            caps.append(cap)
+
+        try:
+            while not self.stop_flag.is_set():
+                capture_start = time.perf_counter()
+                frames = []
+                for cap in caps:
+                    ret, frame = cap.read()
+                    if not ret:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = cap.read()
+                    frames.append(frame)
+                self.latency_tracker.record_capture(time.perf_counter() - capture_start)
+
+                batch_imgs, idx_map = [], []
+                for i, f in enumerate(frames):
+                    if f is not None:
+                        batch_imgs.append(f)
+                        idx_map.append(i)
+
+                results = []
+                if batch_imgs:
+                    results = self._batch_infer(model, batch_imgs, device)
+
+                self._display_frames(frames, results, idx_map)
+
+        finally:
+            for cap in caps:
+                cap.release()
+
+    def run_rtsp_mode(self):
+        """ Runs the inferencer in RTSP mode. """
+        model, device = self._init_yolo()
         cams = []
-        for cam in self.cameras:
+
+        for cam in self.target_sources:
             cap = GstCam(self.build_pipeline(cam.full_link, TILE_W, TILE_H))
             cam = Cam(url=cam.full_link, cap=cap, q=queue.Queue(maxsize=1))
             t = threading.Thread(target=self.reader_thread, args=(cam,), daemon=True)
             t.start()
             cams.append(cam)
-
-        smoothed_fps = 0.0
-        last_fps_print = time.perf_counter()
 
         try:
             while not self.stop_flag.is_set():
@@ -195,45 +285,12 @@ class Inferencer:
                         idx_map.append(i)
 
                 results = []
-                if batch_imgs:
-                    inf_start = time.perf_counter()
-                    preds = model.predict(
-                        batch_imgs,
-                        imgsz=max(TILE_W, TILE_H),
-                        device=device,
-                        half=(device != "cpu"),
-                        conf=0.25,
-                        iou=0.45,
-                        verbose=False
-                    )
-                    results = preds
-                    self.latency_tracker.record_inference(time.perf_counter() - inf_start)
-                
-                display_start = time.perf_counter()
-                if results:
-                    class_names = results[0].names
-                    for r, i in zip(results, idx_map):
-                        if r.boxes is not None and len(r.boxes) > 0:
-                            xyxy = r.boxes.xyxy.cpu().numpy()
-                            conf = r.boxes.conf.unsqueeze(1).cpu().numpy()
-                            cls  = r.boxes.cls.unsqueeze(1).cpu().numpy()
-                            boxes = np.concatenate([xyxy, conf, cls], axis=1)
-                            frames[i] = self.draw_boxes(frames[i], boxes, class_names)
 
-                # update each QLabel
-                for i, frame in enumerate(frames):
-                    if frame is None:
-                        continue
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    h, w, ch = rgb.shape
-                    qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-                    pix = QPixmap.fromImage(qimg)
-                    self.label_widgets[i].setPixmap(pix.scaled(
-                        self.label_widgets[i].size(),
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation
-                    ))
-                self.latency_tracker.record_display(time.perf_counter() - display_start)
+                # Batch infer
+                if batch_imgs:
+                    results = self._batch_infer(model, batch_imgs, device)
+                
+                self._display_frames(frames, results, idx_map)
 
         finally:
             for cam in cams:
