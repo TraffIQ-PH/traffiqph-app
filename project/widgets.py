@@ -14,6 +14,7 @@ from threading import Thread, Event
 
 from inference import Inferencer
 from classes import Camera, LatencyTracker, ProxyCamera
+import numpy as np
 
 asset_path = str(Path(__file__).parent / "assets")
 
@@ -100,8 +101,8 @@ class MainWindow(QMainWindow):
         self.camera_widget = CameraWidget()
         self.metrics_widget = MetricsWidget()
         self.logs_widget = LogsWidget()
-        self.chart_left_widget = HeatmapChartWidget("Heatmap Chart")
-        self.chart_right_widget = MetricsChartWidget()
+        self.chart_left_widget = InferenceMetricsChartWidget()
+        self.chart_right_widget = SystemMetricsChartWidget()
 
         self.cam_labels = [
             self.camera_widget.top_split.widget(0),
@@ -116,7 +117,7 @@ class MainWindow(QMainWindow):
         self.dock_metrics = self._add_dock("System Metrics", self.metrics_widget, Qt.RightDockWidgetArea)
         self.dock_logs = self._add_dock("Logs", self.logs_widget, Qt.RightDockWidgetArea)
         self.splitDockWidget(self.dock_metrics, self.dock_logs, Qt.Vertical)
-        self.dock_chart_left = self._add_dock("Live Chart A", self.chart_left_widget, Qt.BottomDockWidgetArea)
+        self.dock_chart_left = self._add_dock("Delay Metrics Chart", self.chart_left_widget, Qt.BottomDockWidgetArea)
         self.dock_chart_right = self._add_dock("System Metrics Chart", self.chart_right_widget, Qt.BottomDockWidgetArea)
         self.splitDockWidget(self.dock_chart_left, self.dock_chart_right, Qt.Horizontal)
         self.resizeDocks([self.dock_cameras, self.dock_chart_left], [700, 200], Qt.Vertical)
@@ -1147,7 +1148,7 @@ class LogsWidget(QTextEdit):
         self.setReadOnly(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-class MetricsChartWidget(QWidget):
+class SystemMetricsChartWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -1168,7 +1169,7 @@ class MetricsChartWidget(QWidget):
         self.gpu_line = self.plot_widget.plot(pen=pg.mkPen("c", width=2), name="GPU")
 
         # Buffers (180 data points ≈ 3 min at 1 Hz)
-        self.max_points = 180
+        self.max_points = 120
         self.cpu_data, self.ram_data, self.gpu_data = [], [], []
         self.time_data = []
 
@@ -1210,16 +1211,59 @@ class MetricsChartWidget(QWidget):
         self.ram_line.setData(self.time_data, self.ram_data)
         self.gpu_line.setData(self.time_data, self.gpu_data)
 
-class HeatmapChartWidget(QLabel):
-    def __init__(self, text, parent=None):
+class InferenceMetricsChartWidget(QWidget):
+    def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.make_chart_label(text)
-    
-    def make_chart_label(self, text):
-        self.setText(text)
-        self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background: #55aa55; color: white; border: 1px solid black;")
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumHeight(100)
-        self.setMaximumHeight(300)
+        layout = QVBoxLayout(self)
+        self.plot_widget = pg.PlotWidget(background="#222")
+        layout.addWidget(self.plot_widget)
+
+        # --- Plot setup ---
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.setLabel("bottom", "Frame")
+        self.plot_widget.setLabel("left", "Latency", units="ms")
+        self.plot_widget.enableAutoRange(axis='y', enable=True)
+        self.plot_widget.addLegend()
+
+        # Lines for CPU, RAM, GPU
+        self.cam_line = self.plot_widget.plot(pen=pg.mkPen("y", width=2), name="Camera")
+        self.inf_line = self.plot_widget.plot(pen=pg.mkPen("r", width=2), name="Inference")
+        self.dis_line = self.plot_widget.plot(pen=pg.mkPen("c", width=2), name="Display")
+
+        # Buffers (180 data points ≈ 3 min at 1 Hz)
+        self.max_points = 120
+        self.cam_data, self.inf_data, self.dis_data = [], [], []
+        self.time_data = []
+
+        # Timer for updates
+        self.start_time = time.time()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_data)
+        self.timer.start(1000)  # every 1 s
+
+    def update_data(self):
+        now = time.time() - self.start_time
+        data = self.parent().parent().latency_tracker.summary()
+
+        cam = data.get("capture", 0) * 1000
+        inf = data.get("inference", 0) * 1000
+        dis = data.get("display", 0) * 1000
+
+        # Append new samples
+        self.time_data.append(now)
+        self.cam_data.append(cam)
+        self.inf_data.append(inf)
+        self.dis_data.append(dis)
+
+        # Keep only last 180 samples
+        if len(self.time_data) > self.max_points:
+            self.time_data = self.time_data[-self.max_points:]
+            self.cam_data = self.cam_data[-self.max_points:]
+            self.inf_data = self.inf_data[-self.max_points:]
+            self.dis_data = self.dis_data[-self.max_points:]
+
+        # Update plot lines
+        self.cam_line.setData(self.time_data, self.cam_data)
+        self.inf_line.setData(self.time_data, self.inf_data)
+        self.dis_line.setData(self.time_data, self.dis_data)
