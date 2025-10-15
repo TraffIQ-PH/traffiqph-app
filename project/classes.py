@@ -8,6 +8,7 @@ class BaseCamera:
     name: str
     location: str
     max_cap: int
+    
 
 @dataclass
 class Camera(BaseCamera):
@@ -16,6 +17,7 @@ class Camera(BaseCamera):
     password: str
     rtsp_port: int
     channel: int
+    roi: tuple[int, int, int] | None = None
     
     def __post_init__(self):
         self.full_link = f'rtsp://{self.username}:{self.password}@{self.ip_address}:{self.rtsp_port}/Streaming/Channels/{self.channel}'
@@ -26,6 +28,7 @@ class Camera(BaseCamera):
 @dataclass
 class ProxyCamera(BaseCamera):
     file_path: str
+    roi: tuple[int, int, int] | None = None
 
 
 class LatencyTracker:

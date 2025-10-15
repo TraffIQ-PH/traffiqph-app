@@ -143,6 +143,18 @@ class Inferencer:
             "light":        (0, 255, 0),     # Green
             "heavy":        (255, 0, 255),   # Purple
         }
+            # --- Get current frame dimensions (O(1) operation) ---
+        h, w = frame.shape[:2]
+
+        # --- Compute scale factor relative to 1280x720 baseline ---
+        base_w, base_h = 1280, 720
+        scale = ((w / base_w) + (h / base_h)) / 2.0
+
+        # --- Adaptive visual parameters ---
+        font_scale = 0.6 * scale
+        box_thickness = max(1, int(0.8 * scale))
+        text_thickness = max(1, int(1.2 * scale))
+        padding = int(3 * scale)
 
         for x1, y1, x2, y2, conf, cls in boxes:
             cls = int(cls)
@@ -155,14 +167,16 @@ class Inferencer:
 
             x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
             label = f"{name} {float(conf):.2f}"
-
-            # Draw filled label background
-            (tw, th), _ = cv2.getTextSize(label, FONT, 0.6, 2)
-            cv2.rectangle(frame, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), color, -1)
+            
+            
 
             # Draw main bounding box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, DRAW_THICKNESS)
-            cv2.putText(frame, label, (x1 + 3, max(0, y1 - 4)), FONT, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_thickness)
+            
+            if self.display_settings["osd"].get("annotations", False):
+                (tw, th), _ = cv2.getTextSize(label, FONT, font_scale, text_thickness)
+                cv2.rectangle(frame, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), color, -1)
+                cv2.putText(frame, label, (x1 + padding, max(0, y1 - padding)), FONT, font_scale, (0, 0, 0), text_thickness, cv2.LINE_AA)
 
         return frame
 
@@ -190,7 +204,7 @@ class Inferencer:
             imgsz=max(TILE_W, TILE_H),
             device=device,
             half=(device != "cpu"),
-            conf=0.25,
+            conf=0.5,
             iou=0.45,
             verbose=False
         )
@@ -344,6 +358,10 @@ class Inferencer:
                     if not ret:
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         ret, frame = cap.read()
+                    
+                    if ret and frame is not None:
+                        frame = cv2.resize(frame, (TILE_W, TILE_H), interpolation=cv2.INTER_AREA)
+
                     frames.append(frame)
                 self.latency_tracker.record_capture(time.perf_counter() - capture_start)
 
@@ -369,7 +387,7 @@ class Inferencer:
         cams = []
 
         for cam in self.target_sources:
-            cap = GstCam(self.build_pipeline(cam.full_link))
+            cap = GstCam(self.build_pipeline(cam.full_link, TILE_W, TILE_H))
             cam = Cam(url=cam.full_link, cap=cap, q=queue.Queue(maxsize=1))
             t = threading.Thread(target=self.reader_thread, args=(cam,), daemon=True)
             t.start()

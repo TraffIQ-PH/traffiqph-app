@@ -206,6 +206,7 @@ class MainWindow(QMainWindow):
                     "name": True,
                     "location": False,
                     "estimated_congestion": True,
+                    "annotations": True,
                 },
                 "logs": {
                     "log_level": "Info",
@@ -869,10 +870,12 @@ class ChangeDisplaySettingsDialog(QDialog):
         self.cb_name = QCheckBox("Name")
         self.cb_location = QCheckBox("Location")
         self.cb_congestion = QCheckBox("Estimated Congestion")
+        self.cb_annotations = QCheckBox("Annotations")
 
         osd_layout.addWidget(self.cb_name)
         osd_layout.addWidget(self.cb_location)
         osd_layout.addWidget(self.cb_congestion)
+        osd_layout.addWidget(self.cb_annotations)
 
         osd_group.setLayout(osd_layout)
         main_layout.addWidget(osd_group)
@@ -916,6 +919,7 @@ class ChangeDisplaySettingsDialog(QDialog):
                 "name": self.cb_name.isChecked(),
                 "location": self.cb_location.isChecked(),
                 "estimated_congestion": self.cb_congestion.isChecked(),
+                "annotations": self.cb_annotations.isChecked()
             },
             "logs": {
                 "log_level": self.cb_log_level.currentText()
@@ -935,6 +939,7 @@ class ChangeDisplaySettingsDialog(QDialog):
         self.cb_name.setChecked(osd.get("name", False))
         self.cb_location.setChecked(osd.get("location", False))
         self.cb_congestion.setChecked(osd.get("estimated_congestion", False))
+        self.cb_annotations.setChecked(osd.get("annotations", False))
         log_level = logs.get("log_level", "Info")   # default to "Info"
         idx = self.cb_log_level.findText(log_level)
         if idx >= 0:
@@ -1134,8 +1139,10 @@ class MetricsWidget(QWidget):
         self.time_label.setText(current.toString("hh:mm:ss ap"))
 
         summary = self.parent().parent().latency_tracker.summary()
-
-        if summary["total"]: self.fps_label.setText(f"{len(self.parent().parent().cameras) / summary['total']:.1f}")
+        
+        if summary["total"]:
+            fps = len(self.parent().parent().cameras) or len(self.parent().parent().proxy_cameras) / summary['total']
+            self.fps_label.setText(f"{fps:.1f}")
         self.latency_total.setText(f"{summary['total']*1000:.1f} ms")
         self.latency_camera.setText(f"{summary['capture']*1000:.1f} ms")
         self.latency_inference.setText(f"{summary['inference']*1000:.1f} ms")
