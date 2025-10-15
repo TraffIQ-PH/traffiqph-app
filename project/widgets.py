@@ -2,8 +2,8 @@
 from PySide6.QtWidgets import (QApplication, QMainWindow, QToolBar, QMenuBar, QDialog, QLineEdit, QFormLayout, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QMessageBox, QStatusBar, QCheckBox, QGroupBox, QLabel, QFileDialog, QComboBox, QWidget, QSizePolicy, QSplitter,
                                 QDockWidget, QTextEdit, QProgressBar, QListWidget, QListWidgetItem, QScrollArea)
-from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray, QTimer, QDateTime, QFileInfo, Signal
-from PySide6.QtGui import QIcon, QAction, QIntValidator, QRegularExpressionValidator
+from PySide6.QtCore import Qt, QSize, QRegularExpression, QSettings, QByteArray, QTimer, QDateTime, QFileInfo, Signal, QPoint, QRect 
+from PySide6.QtGui import QIcon, QAction, QIntValidator, QRegularExpressionValidator, QPixmap, QImage, QPainter, QColor, QPen, QPolygonF
 import pyqtgraph as pg
 import json
 from pathlib import Path
@@ -552,7 +552,13 @@ class MainToolBar(QToolBar):
             self.parent().display_settings_changed.emit(self.parent().display_settings)
         
     def _edit_region(self):
-        print("Edit region of interest")
+        dlg = EditRegionDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            cam = dlg.get_selected_camera()
+            if cam:
+                self.editor = ROIEditorWindow(cam, parent=self.parent())
+                self.editor.show()
+
 
     def _change_experimental_settings(self):
         """
@@ -946,7 +952,235 @@ class ChangeDisplaySettingsDialog(QDialog):
             self.cb_log_level.setCurrentIndex(idx)
 
 class EditRegionDialog(QDialog):
-    pass
+    """Dialog to select which camera's ROI to edit."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Camera to Edit ROI")
+        self.setMinimumWidth(400)
+
+        if self.parent().parent().experimental_settings.get("use_videos", False):
+            self.cameras = self.parent().parent().proxy_cameras
+        else:
+            self.cameras = self.parent().parent().cameras
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Choose a camera:"))
+
+        self.combo = QComboBox()
+        for cam in self.cameras:
+            self.combo.addItem(cam.name)
+        layout.addWidget(self.combo)
+
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+
+    def get_selected_camera(self):
+        idx = self.combo.currentIndex()
+        return self.cameras[idx] if 0 <= idx < len(self.cameras) else None
+
+class ROIEditorWindow(QMainWindow):
+    """ROI editor window showing a snapshot and an adjustable quadrilateral."""
+    def __init__(self, camera, parent=None):
+        super().__init__(parent)
+        self.camera = camera
+        self.setWindowTitle(f"Edit ROI — {camera.name}")
+
+        # --- Load snapshot first ---
+        snapshot, frame_rect = self._get_snapshot()
+
+        # --- Central widget setup ---
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        # --- Image label ---
+        self.image_label = QLabel()
+        self.image_label.setPixmap(snapshot)
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setStyleSheet("background: black;")
+        layout.addWidget(self.image_label)
+
+        # --- ROI overlay ---
+        self.overlay = ROICanvas(self.image_label, camera.roi, frame_rect)
+        self.overlay.setGeometry(frame_rect)
+        self.overlay.show()
+
+        # --- Buttons ---
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        cancel_btn = QPushButton("Cancel")
+        btn_layout.addStretch()
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+        save_btn.clicked.connect(self._save_roi)
+        cancel_btn.clicked.connect(self.close)
+
+        # --- Let the window adapt automatically ---
+        self.adjustSize()
+
+
+    def _get_snapshot(self):
+        """Capture a single frame and scale to fit 1280x720 while keeping aspect ratio."""
+        import cv2, numpy as np
+
+        target_w, target_h = 1280, 720
+        frame_rect = QRect(0, 0, target_w, target_h)
+
+        try:
+            if hasattr(self.camera, "file_path"):
+                src = self.camera.file_path
+            elif hasattr(self.camera, "full_link"):
+                src = self.camera.full_link
+            else:
+                raise AttributeError("Camera source not found.")
+
+            cap = cv2.VideoCapture(src)
+            ret, frame = cap.read()
+            cap.release()
+
+            if not ret or frame is None:
+                raise RuntimeError("Failed to capture frame.")
+
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, _ = frame.shape
+
+            scale = min(target_w / w, target_h / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            x_offset = (target_w - new_w) // 2
+            y_offset = (target_h - new_h) // 2
+            canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = frame
+
+            frame_rect = QRect(x_offset, y_offset, new_w, new_h)
+
+            qimg = QImage(canvas.data, target_w, target_h, target_w * 3, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg)
+            return pixmap, frame_rect
+
+        except Exception as e:
+            print(f"[WARN] Snapshot failed: {e}")
+            pix = QPixmap(target_w, target_h)
+            pix.fill(Qt.black)
+            return pix, frame_rect
+
+
+    def _save_roi(self):
+        if not hasattr(self.overlay, "points"):
+            return
+        pix_rect = self.image_label.pixmap().rect()
+        w, h = pix_rect.width(), pix_rect.height()
+        normalized = [(p.x() / w, p.y() / h) for p in self.overlay.points]
+        self.camera.roi = normalized
+        print(f"[INFO] Saved ROI for {self.camera.name}: {normalized}")
+        self.close()
+
+class ROICanvas(QWidget):
+    """A direct, embedded ROI polygon editor (bounded to frame_rect)."""
+    def __init__(self, parent, roi_points=None, frame_rect=None):
+        super().__init__(parent)
+        self.frame_rect = frame_rect or parent.pixmap().rect()
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.dragging = False
+        self.active_handle = None
+        self.handle_size = 10
+
+        w, h = self.frame_rect.width(), self.frame_rect.height()
+        x0, y0 = self.frame_rect.x(), self.frame_rect.y()
+
+        if roi_points:
+            # Restore saved ROI in normalized coordinates
+            self.points = [QPoint(int(x0 + x * w), int(y0 + y * h)) for x, y in roi_points]
+        else:
+            scale = 0.99
+            pad_x = int((1 - scale) * w / 2)
+            pad_y = int((1 - scale) * h / 2)
+
+            self.points = [
+                QPoint(x0 + pad_x, y0 + pad_y),
+                QPoint(x0 + w - pad_x, y0 + pad_y),
+                QPoint(x0 + w - pad_x, y0 + h - pad_y),
+                QPoint(x0 + pad_x, y0 + h - pad_y)
+            ]
+
+    # --- painting ---
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        poly = QPolygonF(self.points)
+        p.setBrush(QColor(0, 0, 255, 80))
+        p.setPen(QPen(QColor("white"), 2))
+        p.drawPolygon(poly)
+
+        handle_color = QColor(173, 216, 230)
+        for pt in self.points:
+            p.fillRect(QRect(pt.x() - 5, pt.y() - 5, 10, 10), handle_color)
+
+    # --- interaction ---
+    def mousePressEvent(self, e):
+        pos = e.pos()
+        for i, pt in enumerate(self.points):
+            if QRect(pt.x() - 5, pt.y() - 5, 10, 10).contains(pos):
+                self.active_handle = i
+                self.dragging = True
+                return
+        if QPolygonF(self.points).containsPoint(pos, Qt.OddEvenFill):
+            self.active_handle = -1
+            self.drag_offset = pos
+            self.dragging = True
+
+    def mouseMoveEvent(self, e):
+        if not self.dragging:
+            return
+
+        pos = e.pos()
+        fr = self.frame_rect
+
+        if self.active_handle == -1:
+            # Move entire polygon
+            dx = pos.x() - self.drag_offset.x()
+            dy = pos.y() - self.drag_offset.y()
+            moved_points = [QPoint(pt.x() + dx, pt.y() + dy) for pt in self.points]
+
+            # Clamp polygon within frame bounds
+            poly_rect = QPolygonF(moved_points).boundingRect()
+            if poly_rect.left() < fr.left():
+                dx += fr.left() - poly_rect.left()
+            if poly_rect.top() < fr.top():
+                dy += fr.top() - poly_rect.top()
+            if poly_rect.right() > fr.right():
+                dx -= poly_rect.right() - fr.right()
+            if poly_rect.bottom() > fr.bottom():
+                dy -= poly_rect.bottom() - fr.bottom()
+
+            self.points = [QPoint(pt.x() + dx, pt.y() + dy) for pt in self.points]
+            self.drag_offset = pos
+
+        else:
+            # Move a single handle (bounded)
+            x = max(fr.left(), min(pos.x(), fr.right()))
+            y = max(fr.top(), min(pos.y(), fr.bottom()))
+            self.points[self.active_handle] = QPoint(x, y)
+
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        self.dragging = False
+        self.active_handle = None
+
 
 class ChangeExperimentalSettingsDialog(QDialog):
     """
