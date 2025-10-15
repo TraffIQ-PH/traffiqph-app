@@ -22,6 +22,7 @@ class MainWindow(QMainWindow):
 
     # Signals -- defined outside init
     display_settings_changed = Signal(dict)
+    camera_data_changed = Signal(list)
 
     def __init__(self, app: QApplication):
         super().__init__()
@@ -91,6 +92,8 @@ class MainWindow(QMainWindow):
             daemon=True
         )
         self.display_settings_changed.connect(self.inferencer.on_display_settings_changed)
+        self.camera_data_changed.connect(self.inferencer.on_camera_data_changed)
+
 
         self.yolo_thread.start()
 
@@ -207,6 +210,7 @@ class MainWindow(QMainWindow):
                     "location": False,
                     "estimated_congestion": True,
                     "annotations": True,
+                    "roi": False,
                 },
                 "logs": {
                     "log_level": "Info",
@@ -256,7 +260,7 @@ class MainWindow(QMainWindow):
 
         self._log_message("All settings have been saved in your computer.", 3000)
 
-    def save_cameras(self):
+    def save_cameras(self, emit=False):
         """ Saves camera and proxy camera instances. """
         data = [cam.__dict__.copy() for cam in self.cameras]
         for d in data:
@@ -265,6 +269,10 @@ class MainWindow(QMainWindow):
 
         data = [proxy_cam.__dict__.copy() for proxy_cam in self.proxy_cameras]
         self.settings.setValue("proxy_cameras", json.dumps(data))
+
+        if emit:
+            all_cams = self.proxy_cameras if self.experimental_settings.get("use_videos", False) else self.cameras
+            self.camera_data_changed.emit(all_cams)
 
     def _load_configs(self):
         """Import settings from a JSON file."""
@@ -289,6 +297,7 @@ class MainWindow(QMainWindow):
             self.proxy_cameras.append(ProxyCamera(**entry))
 
         self.start_yolo()
+        
 
 
         # restore layout settings
@@ -877,11 +886,13 @@ class ChangeDisplaySettingsDialog(QDialog):
         self.cb_location = QCheckBox("Location")
         self.cb_congestion = QCheckBox("Estimated Congestion")
         self.cb_annotations = QCheckBox("Annotations")
+        self.cb_roi = QCheckBox("Region of Interests")
 
         osd_layout.addWidget(self.cb_name)
         osd_layout.addWidget(self.cb_location)
         osd_layout.addWidget(self.cb_congestion)
         osd_layout.addWidget(self.cb_annotations)
+        osd_layout.addWidget(self.cb_roi)
 
         osd_group.setLayout(osd_layout)
         main_layout.addWidget(osd_group)
@@ -925,7 +936,8 @@ class ChangeDisplaySettingsDialog(QDialog):
                 "name": self.cb_name.isChecked(),
                 "location": self.cb_location.isChecked(),
                 "estimated_congestion": self.cb_congestion.isChecked(),
-                "annotations": self.cb_annotations.isChecked()
+                "annotations": self.cb_annotations.isChecked(),
+                "roi": self.cb_roi.isChecked()
             },
             "logs": {
                 "log_level": self.cb_log_level.currentText()
@@ -946,6 +958,7 @@ class ChangeDisplaySettingsDialog(QDialog):
         self.cb_location.setChecked(osd.get("location", False))
         self.cb_congestion.setChecked(osd.get("estimated_congestion", False))
         self.cb_annotations.setChecked(osd.get("annotations", False))
+        self.cb_roi.setChecked(osd.get("roi", False))
         log_level = logs.get("log_level", "Info")   # default to "Info"
         idx = self.cb_log_level.findText(log_level)
         if idx >= 0:
@@ -1085,6 +1098,7 @@ class ROIEditorWindow(QMainWindow):
         normalized = [(p.x() / w, p.y() / h) for p in self.overlay.points]
         self.camera.roi = normalized
         print(f"[INFO] Saved ROI for {self.camera.name}: {normalized}")
+        self.parent().save_cameras(emit=True)
         self.close()
 
 class ROICanvas(QWidget):

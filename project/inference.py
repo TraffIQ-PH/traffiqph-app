@@ -196,11 +196,66 @@ class Inferencer:
 
         return model, device
 
+    def _prepare_roi_crops(self, frames):
+        """
+        Returns a list of masked images (ROI only) and metadata for coordinate restoration.
+        Inference will happen *only inside* the polygon region.
+        """
+        cropped_imgs, roi_info = [], []
+
+        for i, frame in enumerate(frames):
+            cam = self.target_sources[i]
+            if frame is None:
+                cropped_imgs.append(None)
+                roi_info.append((0, 0, 0, 0))
+                continue
+
+            h, w = frame.shape[:2]
+
+            # --- Default: full frame if no ROI ---
+            if not hasattr(cam, "roi") or cam.roi is None:
+                cropped_imgs.append(frame)
+                roi_info.append((0, 0, w, h))
+                continue
+
+            # --- Convert normalized ROI points to pixel coordinates ---
+            roi_pts = np.array([(int(x * w), int(y * h)) for x, y in cam.roi], dtype=np.int32)
+
+            # --- Create mask (white = inside ROI, black = outside) ---
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask, [roi_pts], 255)
+
+            # --- Apply mask: zero out everything outside ROI ---
+            masked_frame = cv2.bitwise_and(frame, frame, mask=mask)
+
+            # --- Crop bounding rect for faster inference ---
+            x1, y1 = np.min(roi_pts, axis=0)
+            x2, y2 = np.max(roi_pts, axis=0)
+
+            # Clamp to bounds
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+
+            roi_crop = masked_frame[y1:y2, x1:x2].copy()
+            cropped_imgs.append(roi_crop)
+            roi_info.append((x1, y1, x2 - x1, y2 - y1))
+
+        return cropped_imgs, roi_info
+
+
     def _batch_infer(self, model, batch_imgs, device):
-        """Run YOLO prediction and record latency."""
+        """Run YOLO strictly within each camera's ROI only."""
+        # Crop first
+        cropped_imgs, self._roi_info = self._prepare_roi_crops(batch_imgs)
+
+        # Remove None frames (keeps batch clean)
+        valid_imgs = [img for img in cropped_imgs if img is not None]
+        if not valid_imgs:
+            return []
+
         inf_start = time.perf_counter()
         preds = model.predict(
-            batch_imgs,
+            valid_imgs,
             imgsz=max(TILE_W, TILE_H),
             device=device,
             half=(device != "cpu"),
@@ -211,30 +266,53 @@ class Inferencer:
         self.latency_tracker.record_inference(time.perf_counter() - inf_start)
         return preds
 
-
     def _display_frames(self, frames, results, idx_map):
-        """Draw boxes and display frames on their respective QLabel widgets."""
+        """Draw bounding boxes and OSD text per frame after ROI-only inference."""
         display_start = time.perf_counter()
+
         if results:
             class_names = results[0].names
-            for r, i in zip(results, idx_map):
+            valid_idx = 0  # results correspond only to valid ROI frames
+
+            for i, frame in enumerate(frames):
+                if frame is None:
+                    continue
+
+                # --- ROI offset info ---
+                x_off, y_off, _, _ = self._roi_info[i]
                 num_objs = 0
-                if r.boxes is not None and len(r.boxes) > 0:
-                    xyxy = r.boxes.xyxy.cpu().numpy()
-                    conf = r.boxes.conf.unsqueeze(1).cpu().numpy()
-                    cls  = r.boxes.cls.unsqueeze(1).cpu().numpy()
-                    boxes = np.concatenate([xyxy, conf, cls], axis=1)
-                    frames[i] = self.draw_boxes(frames[i], boxes, class_names)
 
-                    num_objs = len(r.boxes.cls)
+                # --- Match YOLO output to this frame ---
+                if valid_idx < len(results):
+                    r = results[valid_idx]
+                    valid_idx += 1
 
-                cam = self.target_sources[i]  # the corresponding camera or proxy
-                frames[i] = self.draw_osd(frames[i], cam, num_objs)
+                    if r.boxes is not None and len(r.boxes) > 0:
+                        xyxy = r.boxes.xyxy.cpu().numpy()
+                        conf = r.boxes.conf.unsqueeze(1).cpu().numpy()
+                        cls = r.boxes.cls.unsqueeze(1).cpu().numpy()
+                        boxes = np.concatenate([xyxy, conf, cls], axis=1)
 
-        # Display all frames
+                        # Shift detections back into full-frame coordinates
+                        boxes[:, [0, 2]] += x_off
+                        boxes[:, [1, 3]] += y_off
+
+                        # Draw boxes
+                        frame = self.draw_boxes(frame, boxes, class_names)
+                        num_objs = len(r.boxes.cls)
+
+                # --- Draw OSD ---
+                cam = self.target_sources[i]
+                frame = self.draw_osd(frame, cam, num_objs)
+
+                # --- Update frame list (for display) ---
+                frames[i] = frame
+
+        # --- Display all frames in their QLabel widgets ---
         for i, frame in enumerate(frames):
             if frame is None:
                 continue
+
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
             qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
@@ -245,7 +323,9 @@ class Inferencer:
                 Qt.SmoothTransformation
             ))
 
+        # --- Record latency ---
         self.latency_tracker.record_display(time.perf_counter() - display_start)
+
 
     def draw_osd(self, frame, cam, num_objs):
         """
@@ -291,6 +371,11 @@ class Inferencer:
                 max_cap = 100
             congestion_ratio = num_objs / max_cap if max_cap > 0 else 0
             lines.append(f"Congestion: {congestion_ratio:.2f}")
+        
+        if hasattr(cam, "roi") and cam.roi is not None and osd.get("roi", False):
+            h, w, _ = frame.shape
+            pts = np.array([(int(x*w), int(y*h)) for x, y in cam.roi], dtype=np.int32)
+            cv2.polylines(frame, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
 
         if not lines:
             return frame
@@ -320,6 +405,8 @@ class Inferencer:
                 font, scale, color, thickness, cv2.LINE_AA
             )
             y += line_h
+        
+
 
         return frame
 
@@ -328,6 +415,13 @@ class Inferencer:
     def on_display_settings_changed(self, display_dict):
         self.display_settings = display_dict.copy()
         print(f"[INFO] OSD settings updated: {self.display_settings}")
+    
+    @Slot(list)
+    def on_camera_data_changed(self, new_cameras):
+        """Update camera source list without restarting inference."""
+        self.target_sources = new_cameras
+        print("[INFO] Inference camera sources updated.")
+
 
     def run(self):
         if not self.target_sources:
