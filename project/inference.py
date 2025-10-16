@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt, Slot
 import torch
 from ultralytics import YOLO
 from classes import Camera, ProxyCamera
-
+from trackers import CentroidObstructionTracker
 
 # --- CONFIG ---
 MODEL_PATH = str(Path(__file__).parent.parent / "yolo" / "best.pt")  # adjust to your model
@@ -80,6 +80,17 @@ class Inferencer:
         self.stop_flag = stop_flag
         self.latency_tracker = latency_tracker
         self.display_settings = display_settings
+
+        self.tracker = CentroidObstructionTracker(
+            alpha=0.30,          # v_i < 0.30 * mean_v  -> suspect
+            hold_time=3.0,       # seconds below threshold to declare obstruction
+            fps_hint=30.0,
+            iou_thresh=0.3,
+            dist_thresh=80.0,
+            max_miss_time=1.5,
+            H=None,              # <-- set your 3x3 homography here when ready
+            scale_mpp=0.05       # fallback if H is None
+        )
 
     def build_pipeline(self, rtsp_url: str, w: int | None = None, h: int | None = None) -> str:
         size_caps = ""
@@ -264,6 +275,39 @@ class Inferencer:
             verbose=False
         )
         self.latency_tracker.record_inference(time.perf_counter() - inf_start)
+
+            # ---- Build full-frame boxes for tracking ----
+        frame_time = time.time()
+        all_boxes_xyxy = []  # flatten across the valid frames (your display code already remaps by index)
+        valid_idx = 0
+        for i in range(len(batch_imgs)):
+            # each 'i' corresponds to frames; guard because you only predicted on valid ones
+            if batch_imgs[i] is None:
+                continue
+            r = preds[valid_idx]
+            valid_idx += 1
+            if r.boxes is not None and len(r.boxes) > 0:
+                xyxy = r.boxes.xyxy.cpu().numpy()
+                # shift back to full-frame coords using stored ROI offsets
+                x_off, y_off, _, _ = self._roi_info[i]
+                if xyxy.size > 0:
+                    xyxy[:, [0, 2]] += x_off
+                    xyxy[:, [1, 3]] += y_off
+                    for box in xyxy:
+                        all_boxes_xyxy.append(box.tolist())
+
+        # ---- Update tracker with all full-frame detections this cycle ----
+        tracks_state = self.tracker.update(all_boxes_xyxy, frame_time)
+        # Optionally keep latest summaries for drawing elsewhere
+        self._latest_velocities = self.tracker.latest_velocities
+        self._latest_obstructions = self.tracker.latest_obstructions
+
+        # Print only those declared as obstructions
+        for tid, is_obstructed in self.tracker.latest_obstructions.items():
+            if is_obstructed:
+                v = self.tracker.latest_velocities.get(tid, float("nan"))
+                print(f"[OBSTRUCTION] Track {tid} velocity={v:.2f} m/s")
+
         return preds
 
     def _display_frames(self, frames, results, idx_map):
@@ -299,6 +343,7 @@ class Inferencer:
 
                         # Draw boxes
                         frame = self.draw_boxes(frame, boxes, class_names)
+                        frame = self.draw_obstruction(frame)
                         num_objs = len(r.boxes.cls)
 
                 # --- Draw OSD ---
@@ -520,3 +565,52 @@ class Inferencer:
                     cam.cap.release()
                 except Exception:
                     pass
+    def draw_obstruction(self, frame):
+        """
+        Draw bounding boxes for current obstructions detected by the tracker.
+
+        Parameters
+        ----------
+        frame : np.ndarray
+            The video frame to draw on (BGR).
+
+        Returns
+        -------
+        np.ndarray
+            The frame with obstruction boxes drawn.
+        """
+        if not hasattr(self, "_latest_obstructions"):
+            return frame
+        if not self._latest_obstructions:
+            return frame
+
+        # Scale-based sizing
+        h, w = frame.shape[:2]
+        base_w, base_h = 1280, 720
+        scale = ((w / base_w) + (h / base_h)) / 2.0
+        font_scale = 0.6 * scale
+        thickness = max(2, int(1.2 * scale))
+        text_thickness = max(1, int(1.2 * scale))
+        padding = int(3 * scale)
+
+        for tid, is_obstruction in self._latest_obstructions.items():
+            if not is_obstruction:
+                continue
+            tr = self.tracker._tracks.get(tid)
+            if not tr:
+                continue
+
+            x1, y1, x2, y2 = map(int, tr["box"])
+            color = (0, 165, 255)  # Orange
+            label = "OBSTRUCTION"
+
+            # Draw box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+
+            # Draw label background
+            (tw, th), _ = cv2.getTextSize(label, FONT, font_scale, text_thickness)
+            cv2.rectangle(frame, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), color, -1)
+            cv2.putText(frame, label, (x1 + padding, max(0, y1 - padding)),
+                        FONT, font_scale, (0, 0, 0), text_thickness, cv2.LINE_AA)
+
+        return frame
