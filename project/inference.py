@@ -19,6 +19,7 @@ import torch
 from ultralytics import YOLO
 from classes import Camera, ProxyCamera
 from trackers import CentroidObstructionTracker
+from publisher import publish
 
 # --- CONFIG ---
 MODEL_PATH = str(Path(__file__).parent.parent / "yolo" / "best.pt")  # adjust to your model
@@ -80,6 +81,14 @@ class Inferencer:
         self.stop_flag = stop_flag
         self.latency_tracker = latency_tracker
         self.display_settings = display_settings
+
+        self.cycle_green = 15
+        self.cycle_yellow = 3
+        self.total_cycle = (self.cycle_green + self.cycle_yellow) * len(self.target_sources)
+        self.start_time = time.time()
+
+        self.last_green_lane = None
+        self.lanes = ["A", "B", "C", "D"]
 
         self.tracker = CentroidObstructionTracker(
             alpha=0.30,          # v_i < 0.30 * mean_v  -> suspect
@@ -387,7 +396,7 @@ class Inferencer:
 
         # --- Compute scale relative to reference resolution ---
         # Reference = 1280x720; change to your usual baseline
-        base_w, base_h = 1280, 720
+        base_w, base_h = TILE_W, TILE_H
         scale_factor = ((w / base_w) + (h / base_h)) / 2.0  # geometric mean works too
 
         # --- Adjustable visual parameters scaled ---
@@ -451,6 +460,21 @@ class Inferencer:
             )
             y += line_h
         
+
+        # --- Traffic Signal (top-right corner) ---
+        radius = int(15 * scale_factor)
+        gap = int(8 * scale_factor)
+        x_right = w - margin_x - radius
+        y_top = margin_y + radius + 5
+
+        signal = self._get_signal_state(cam)
+        colors = {"red": (0, 0, 255), "yellow": (0, 255, 255), "green": (0, 255, 0)}
+
+        for i, c in enumerate(["red", "yellow", "green"]):
+            cy = y_top + i * (2 * radius + gap)
+            circle_color = colors[c] if signal == c else (80, 80, 80)
+            cv2.circle(frame, (x_right, cy), radius, circle_color, -1)
+            cv2.circle(frame, (x_right, cy), radius, (0, 0, 0), 2)
 
 
         return frame
@@ -614,3 +638,38 @@ class Inferencer:
                         FONT, font_scale, (0, 0, 0), text_thickness, cv2.LINE_AA)
 
         return frame
+
+    def _get_signal_state(self, cam):
+        """
+        Determine the light color (green/yellow/red) based on the rotating lane cycle.
+        Only triggers publish() when a *new* lane turns green.
+        """
+        elapsed = (time.time() - self.start_time) % self.total_cycle
+        lane_index = int(elapsed // (self.cycle_green + self.cycle_yellow))
+        lane = self.lanes[lane_index]  # active lane this cycle
+        phase_time = elapsed % (self.cycle_green + self.cycle_yellow)
+
+        # Determine color for the *active* lane
+        if phase_time < self.cycle_green:
+            current_state = "green"
+        else:
+            current_state = "yellow"
+
+        # Determine each camera’s current state
+        cam_index = self.lanes.index(cam.name[-1]) if cam.name[-1] in self.lanes else 0
+        cam_lane = self.lanes[cam_index]
+        state = "red"
+
+        if cam_lane == lane:
+            state = current_state
+
+        # --- Publish event only when the green lane changes ---
+        if current_state == "green" and self.last_green_lane != lane:
+            self.last_green_lane = lane
+            print(f"[INFO] Lane {lane} turned GREEN → publishing to RPi...")
+            try:
+                publish(lane)
+            except Exception as e:
+                print(f"[ERROR] MQTT publish failed for lane {lane}: {e}")
+
+        return state

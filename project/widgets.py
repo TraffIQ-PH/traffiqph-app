@@ -211,6 +211,7 @@ class MainWindow(QMainWindow):
                     "estimated_congestion": True,
                     "annotations": True,
                     "roi": False,
+                    "traffic_phase": True
                 },
                 "logs": {
                     "log_level": "Info",
@@ -887,12 +888,14 @@ class ChangeDisplaySettingsDialog(QDialog):
         self.cb_congestion = QCheckBox("Estimated Congestion")
         self.cb_annotations = QCheckBox("Annotations")
         self.cb_roi = QCheckBox("Region of Interests")
+        self.cb_traffic_phase = QCheckBox("Traffic Phase")
 
         osd_layout.addWidget(self.cb_name)
         osd_layout.addWidget(self.cb_location)
         osd_layout.addWidget(self.cb_congestion)
         osd_layout.addWidget(self.cb_annotations)
         osd_layout.addWidget(self.cb_roi)
+        osd_layout.addWidget(self.cb_traffic_phase)
 
         osd_group.setLayout(osd_layout)
         main_layout.addWidget(osd_group)
@@ -937,7 +940,8 @@ class ChangeDisplaySettingsDialog(QDialog):
                 "location": self.cb_location.isChecked(),
                 "estimated_congestion": self.cb_congestion.isChecked(),
                 "annotations": self.cb_annotations.isChecked(),
-                "roi": self.cb_roi.isChecked()
+                "roi": self.cb_roi.isChecked(),
+                "traffic_phase": self.cb_traffic_phase.isChecked()
             },
             "logs": {
                 "log_level": self.cb_log_level.currentText()
@@ -959,6 +963,7 @@ class ChangeDisplaySettingsDialog(QDialog):
         self.cb_congestion.setChecked(osd.get("estimated_congestion", False))
         self.cb_annotations.setChecked(osd.get("annotations", False))
         self.cb_roi.setChecked(osd.get("roi", False))
+        self.cb_traffic_phase.setChecked(osd.get("traffic_phase", False))
         log_level = logs.get("log_level", "Info")   # default to "Info"
         idx = self.cb_log_level.findText(log_level)
         if idx >= 0:
